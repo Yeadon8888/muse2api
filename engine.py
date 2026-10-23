@@ -107,8 +107,11 @@ class MuseEngine:
             f"--remote-debugging-port={self.cfg.cdp_port}",
             "--remote-allow-origins=*",
             f"--user-data-dir={self.cfg.profile_dir}",
-            "about:blank",
         ]
+        proxy_server = getattr(self.cfg, "proxy_server", "")
+        if proxy_server:
+            args.append(f"--proxy-server={proxy_server}")
+        args.append("about:blank")
         # 尝试复用已有健康 CDP
         if not self.proc:
             try:

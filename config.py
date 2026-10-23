@@ -71,6 +71,7 @@ class Config:
     # 浏览器
     chromium: str = field(default_factory=_detect_chromium)
     cdp_port: int = field(default_factory=lambda: int(_env("MUSE2API_CDP_PORT", "19210")))
+    proxy_server: str = field(default_factory=lambda: _env("MUSE2API_PROXY_SERVER", "").strip())
     home_dir: str = field(default_factory=lambda: _env("MUSE2API_HOME_DIR", os.path.expanduser("~")))
     extra_path: str = field(default_factory=lambda: _env("MUSE2API_EXTRA_PATH", "/snap/bin"))
     site_url: str = field(default_factory=lambda: _env("MUSE2API_SITE", "https://muse.ai/"))
