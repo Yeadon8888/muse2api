@@ -2151,6 +2151,13 @@ def _read_env_key(key: str) -> str:
     return ""
 
 
+def _upstream_mutation_enabled() -> bool:
+    """Require an explicit opt-in before replacing or pushing locally maintained code."""
+    return _read_env_key("MUSE2API_ALLOW_UPSTREAM_MUTATION").lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _read_local_version() -> dict:
     p = os.path.join(BASE_DIR, "version.json")
     try:
@@ -2399,6 +2406,11 @@ async def admin_check_update(force: bool = False):
 @app.post("/admin/repo/pull")
 async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
     """一键从 GitHub 官方仓库拉取最新更新并自动平滑重启服务。"""
+    if not _upstream_mutation_enabled():
+        raise HTTPException(
+            409,
+            "当前节点由本地维护分支管理，已禁用一键覆盖更新；请由维护者审核上游后合并",
+        )
     res = await asyncio.to_thread(_upgrade_from_github_sync)
     restart = payload.get("restart", True) if isinstance(payload, dict) else True
     if restart:
@@ -2416,6 +2428,11 @@ async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
 @app.post("/admin/repo/push")
 async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
     """维护者专用：将当前节点核心代码推送到 GitHub 仓库（自动过滤 .env 与 data 目录）。"""
+    if not _upstream_mutation_enabled():
+        raise HTTPException(
+            409,
+            "当前节点未授权从管理页面修改远端仓库；请使用受审查的 Git 工作流",
+        )
     msg = (payload.get("message") or "").strip() or f"chore: sync update ({time.strftime('%Y-%m-%d %H:%M:%S')})"
     new_token = (payload.get("github_token") or "").strip()
     if new_token:

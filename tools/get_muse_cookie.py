@@ -9,10 +9,10 @@
     所以没法用「小书签」或「控制台一行代码」解决，必须让脚本驱动浏览器。
 
 它是怎么工作的？
-    1. 用一个独立的临时配置目录启动一个 Chrome 窗口（不影响你日常用的浏览器）
+    1. 用一个独立的临时配置目录启动 Chrome，或连接已有的指纹浏览器 CDP
     2. 你在那个窗口里登录 muse.ai
     3. 脚本轮询读取 cookie，一拿到就自动上传到 muse2api
-    4. 关掉窗口，完事
+    4. 临时浏览器会关闭；外部指纹窗口保持打开
 
 用法：
     python get_muse_cookie.py --base http://your-server-ip:18610 --key m2a_xxx
@@ -261,6 +261,30 @@ def wait_cdp(port: int, timeout: float = 30.0) -> str:
     raise RuntimeError(f"浏览器调试端口没起来（{port}）：{last}")
 
 
+def wait_cdp_endpoint(endpoint: str, timeout: float = 30.0) -> str:
+    """连接已有浏览器的本地 CDP HTTP/WS 端点。"""
+    endpoint = endpoint.strip().rstrip("/")
+    if endpoint.startswith("ws://"):
+        return endpoint
+    if not endpoint.startswith("http://"):
+        raise RuntimeError("本地 CDP 端点必须以 http:// 或 ws:// 开头")
+
+    deadline = time.time() + timeout
+    version_url = endpoint + "/json/version"
+    last = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(version_url, timeout=2) as response:
+                ws_url = json.load(response).get("webSocketDebuggerUrl")
+            if ws_url:
+                return ws_url
+            last = RuntimeError("/json/version 未返回 webSocketDebuggerUrl")
+        except Exception as exc:                       # noqa: BLE001
+            last = exc
+        time.sleep(0.5)
+    raise RuntimeError(f"已有浏览器的调试端点不可用（{endpoint}）：{last}")
+
+
 # ---------------------------------------------------------------- 读 cookie
 def read_cookies(ws: WS) -> dict[str, dict]:
     """用浏览器级 Storage.getCookies 拿全部 cookie，再筛 muse.ai。
@@ -331,6 +355,10 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=CDP_PORT,
                     help=f"调试端口，默认 {CDP_PORT}")
     ap.add_argument("--chrome", default="", help="手动指定浏览器可执行文件路径")
+    ap.add_argument(
+        "--cdp-endpoint", default="",
+        help="连接已有指纹浏览器的 CDP 地址，如 http://127.0.0.1:13180；不会启动或关闭浏览器",
+    )
     args = ap.parse_args()
 
     say("=" * 66)
@@ -347,42 +375,44 @@ def main() -> int:
     if not args.label:
         args.label = "muse-" + time.strftime("%m%d-%H%M")
 
-    chrome = args.chrome or find_chrome()
-    if not chrome:
-        say("✗ 没找到 Chrome / Edge 浏览器。")
-        say("  请先安装 Chrome，或用 --chrome \"完整路径\" 手动指定。")
-        return 3
-    say(f"浏览器：{chrome}")
+    proc = None
+    profile = None
+    if args.cdp_endpoint:
+        say(f"连接已有指纹浏览器：{args.cdp_endpoint}")
+    else:
+        chrome = args.chrome or find_chrome()
+        if not chrome:
+            say("✗ 没找到 Chrome / Edge 浏览器。")
+            say("  请先安装 Chrome，或用 --chrome \"完整路径\"手动指定。")
+            return 3
+        say(f"浏览器：{chrome}")
 
-    profile = os.path.join(tempfile.gettempdir(), "muse2api-cookie-profile")
-    shutil.rmtree(profile, ignore_errors=True)
-    os.makedirs(profile, exist_ok=True)
+        profile = os.path.join(tempfile.gettempdir(), "muse2api-cookie-profile")
+        shutil.rmtree(profile, ignore_errors=True)
+        os.makedirs(profile, exist_ok=True)
 
-    args_cmd = [
-        chrome,
-        f"--remote-debugging-port={args.port}",
-        f"--user-data-dir={profile}",
-        "--no-first-run", "--no-default-browser-check",
-        # 受限环境（容器 / 沙箱 / CI）里 Chrome 自带的沙箱会初始化失败：
-        #   "sandbox initialization failed: Operation not permitted"
-        # → GPU/网络子进程崩掉 → Chrome 直接退出，调试端口从未监听起来，
-        #   表现是 WebSocket 一握手就 "连接已关闭 / Broken pipe"。
-        # 加下面两个开关可绕过。日常桌面环境无副作用（只是不启用 Chrome 自带沙箱）。
-        "--no-sandbox", "--disable-gpu",
-        "--new-window", SITE,
-    ]
-    say("正在打开一个独立的浏览器窗口（不会动你日常用的浏览器）…")
-    proc = subprocess.Popen(args_cmd, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+        args_cmd = [
+            chrome,
+            f"--remote-debugging-port={args.port}",
+            f"--user-data-dir={profile}",
+            "--no-first-run", "--no-default-browser-check",
+            "--no-sandbox", "--disable-gpu",
+            "--new-window", SITE,
+        ]
+        say("正在打开一个独立的浏览器窗口（不会动你日常用的浏览器）…")
+        proc = subprocess.Popen(args_cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
 
     ws = None
     try:
         try:
-            ws_url = wait_cdp(args.port, 30)
+            ws_url = (wait_cdp_endpoint(args.cdp_endpoint, 30)
+                      if args.cdp_endpoint else wait_cdp(args.port, 30))
         except RuntimeError as exc:
             say(f"✗ {exc}")
-            say("  提示：如果浏览器已经开着，请先完全退出再试一次。")
-            say("  （日常 Chrome 在跑时，新窗口会被它接管，调试端口起不来。）")
+            if not args.cdp_endpoint:
+                say("  提示：如果浏览器已经开着，请先完全退出再试一次。")
+                say("  （日常 Chrome 在跑时，新窗口会被它接管，调试端口起不来。）")
             return 4
         ws = WS(ws_url)
 
@@ -438,10 +468,8 @@ def main() -> int:
         except RuntimeError as exc:
             say(f"✗ {exc}")
             say()
-            say("  cookie 已经抓到了，但上传失败。你可以手动复制下面这行，")
-            say("  粘贴到管理页面的「导入账号」输入框：")
-            say()
-            say("  " + "; ".join(f"{k}={v['value']}" for k, v in got.items()))
+            say("  cookie 已经抓到，但为避免凭据出现在终端日志中不会打印。")
+            say("  请修复服务连接后重新运行，本次登录窗口会保持不变。")
             return 6
 
         say()
@@ -459,12 +487,13 @@ def main() -> int:
     finally:
         if ws:
             ws.close()
-        if not args.keep_open:
+        if proc is not None and not args.keep_open:
             try:
                 proc.terminate()
             except Exception:                           # noqa: BLE001
                 pass
-        shutil.rmtree(profile, ignore_errors=True)
+        if profile:
+            shutil.rmtree(profile, ignore_errors=True)
 
 
 if __name__ == "__main__":
