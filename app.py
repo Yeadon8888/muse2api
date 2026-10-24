@@ -491,6 +491,25 @@ class AccountPatch(BaseModel):
 
 
 # ------------------------- 提示词构造 -------------------------
+def _image_value(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, dict):
+        candidate = value.get("image_url") or value.get("url") or value.get("b64_json")
+        if isinstance(candidate, dict):
+            candidate = candidate.get("url")
+        return candidate if isinstance(candidate, str) and candidate else None
+    return None
+
+
+def _image_references(req: ImageRequest) -> list[str]:
+    """Preserve the caller's reference-image order without reinterpreting payloads."""
+    primary = _image_value(req.reference_image) or _image_value(req.image)
+    if primary:
+        return [primary]
+    return [ref for value in (req.images or []) if (ref := _image_value(value))]
+
+
 def build_image_prompt(r: ImageRequest) -> str:
     has_ref = bool(r.reference_image or r.image or r.images)
     if has_ref:
@@ -852,6 +871,7 @@ def _pos(v) -> bool:
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
+                    reference_images: list[str] | None = None,
                     on_acquired=None) -> tuple[dict, str | None]:
     # Browser ownership covers account selection, retry and cleanup, not just generate().
     deadline = time.monotonic() + max(1, timeout)
@@ -864,14 +884,17 @@ def _run_generation(prompt: str, kind: str, timeout: int,
             except Exception:
                 pass
         return _run_generation_locked(prompt, kind, timeout, account_id,
-                                      on_progress, reference_image, deadline=deadline)
+                                      on_progress, reference_image, reference_images,
+                                      deadline=deadline)
     finally:
         GEN_LOCK.release()
 
 
 def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
-                    reference_image: str | None = None, deadline=None) -> tuple[dict, str | None]:
+                    reference_image: str | None = None,
+                    reference_images: list[str] | None = None,
+                    deadline=None) -> tuple[dict, str | None]:
     remaining_wait = int(deadline - time.monotonic()) if deadline is not None else timeout
     preferred_id = getattr(engine, "current_acc_id", None)
     if kind == "video" and not account_id:
@@ -918,10 +941,16 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 remaining = int(deadline - time.monotonic()) if deadline is not None else timeout
                 if remaining <= 0:
                     raise MuseGenerationError("任务总等待时限已到，停止重试")
+                refs = list(reference_images or [])
+                engine_kwargs = {}
+                if len(refs) == 1 and not reference_image:
+                    reference_image = refs[0]
+                elif len(refs) > 1:
+                    engine_kwargs["reference_images"] = refs
                 res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
                                       timeout=remaining, expires=cur_acc.get("cookies_exp"),
                                       account_id=cur_acc["id"], on_progress=on_progress,
-                                      reference_image=reference_image)
+                                      reference_image=reference_image, **engine_kwargs)
                 store.mark(cur_acc["id"], True, "")
                 _sync_cookies(cur_acc["id"])
                 return res, cur_acc["id"]
@@ -977,14 +1006,14 @@ def _image_response(req: ImageRequest, res: dict) -> dict:
     return {"created": int(time.time()), "data": [item]}
 
 
-def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
+def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
                  idempotency_key: str | None = None):
     """Opt-in polling avoids reverse-proxy timeouts; no generation is repeated by polling."""
     if idempotency_key and len(idempotency_key) > 256:
         raise HTTPException(400, "Idempotency-Key too long")
     key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
     request_hash = hashlib.sha256(json.dumps(
-        {"request": req.model_dump(by_alias=True), "reference": reference_image},
+        {"request": req.model_dump(by_alias=True), "references": reference_images},
         sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     with IMAGE_TASK_LOCK:
         tasks = list(store.tasks.values())
@@ -1016,7 +1045,7 @@ def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
         try:
             res, acc_id = _run_generation(
                 prompt, "image", req.timeout or CFG.image_timeout,
-                reference_image=reference_image,
+                reference_images=reference_images,
                 on_progress=lambda p: store.update_task(tid, progress=p),
                 on_acquired=_on_acquired)
             # Store only media metadata, not large base64 payloads or reference credentials.
@@ -1038,13 +1067,7 @@ def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
 @app.post("/v1/images/tasks")
 def create_image_task(req: ImageRequest,
                       idempotency_key: str | None = Header(default=None), _=Depends(auth)):
-    ref_img = req.reference_image or req.image
-    if isinstance(ref_img, dict):
-        ref_img = ref_img.get("url") or ref_img.get("b64_json")
-    if not ref_img and req.images:
-        first = req.images[0]
-        ref_img = first.get("image_url") or first.get("url") if isinstance(first, dict) else first
-    return _queue_image(req, build_image_prompt(req), ref_img, idempotency_key)
+    return _queue_image(req, build_image_prompt(req), _image_references(req), idempotency_key)
 
 
 @app.get("/v1/images/tasks/{task_id}")
@@ -1062,19 +1085,15 @@ def get_image_task(task_id: str, _=Depends(auth)):
 
 @app.post("/v1/images/generations")
 async def images_generations(req: ImageRequest, _=Depends(auth)):
-    ref_img = req.reference_image or req.image
-    if isinstance(ref_img, dict):
-        ref_img = ref_img.get("url") or ref_img.get("b64_json")
-    if not ref_img and req.images and isinstance(req.images, list):
-        first = req.images[0]
-        ref_img = first.get("image_url") or first.get("url") if isinstance(first, dict) else first
+    ref_images = _image_references(req)
 
     prompt = build_image_prompt(req)
     timeout = req.timeout or CFG.image_timeout
     if req.async_:
-        return _queue_image(req, prompt, ref_img)
+        return _queue_image(req, prompt, ref_images)
     try:
-        res, _acc = await asyncio.to_thread(_run_generation, prompt, "image", timeout, reference_image=ref_img)
+        res, _acc = await asyncio.to_thread(
+            _run_generation, prompt, "image", timeout, reference_images=ref_images)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc)) from exc
     except MuseGenerationError as exc:
@@ -1092,7 +1111,7 @@ async def images_edits(request: Request, _=Depends(auth)):
     aspect_ratio = None
     response_format = "url"
     timeout = None
-    ref_image_data = None
+    ref_image_data: list[str] = []
     async_mode = False
 
     if "multipart/form-data" in content_type:
@@ -1109,13 +1128,15 @@ async def images_edits(request: Request, _=Depends(auth)):
                 timeout = int(timeout_val)
             except ValueError:
                 pass
-        img_field = form.get("image")
-        if img_field and hasattr(img_field, "read"):
-            content = await img_field.read()
-            ref_mime = getattr(img_field, "content_type", "image/png") or "image/png"
-            ref_image_data = f"data:{ref_mime};base64,{base64.b64encode(content).decode('ascii')}"
-        elif isinstance(img_field, str):
-            ref_image_data = img_field
+        img_fields = form.getlist("image")
+        for img_field in img_fields:
+            if img_field and hasattr(img_field, "read"):
+                content = await img_field.read()
+                ref_mime = getattr(img_field, "content_type", "image/png") or "image/png"
+                ref_image_data.append(
+                    f"data:{ref_mime};base64,{base64.b64encode(content).decode('ascii')}")
+            elif isinstance(img_field, str) and img_field:
+                ref_image_data.append(img_field)
     else:
         body = await request.json()
         async_mode = body.get("async", False)
@@ -1125,19 +1146,15 @@ async def images_edits(request: Request, _=Depends(auth)):
         aspect_ratio = body.get("aspect_ratio")
         response_format = body.get("response_format") or "url"
         timeout = body.get("timeout")
-        img_val = body.get("image")
-        if isinstance(img_val, dict):
-            ref_image_data = img_val.get("url") or img_val.get("b64_json")
-        elif isinstance(img_val, str):
-            ref_image_data = img_val
-        if not ref_image_data and body.get("images") and isinstance(body.get("images"), list):
-            first = body["images"][0]
-            if isinstance(first, dict):
-                ref_image_data = first.get("image_url") or first.get("url")
-            elif isinstance(first, str):
-                ref_image_data = first
+        img_val = _image_value(body.get("image"))
+        if img_val:
+            ref_image_data = [img_val]
+        if not ref_image_data and isinstance(body.get("images"), list):
+            ref_image_data = [
+                ref for value in body["images"] if (ref := _image_value(value))]
         if not ref_image_data:
-            ref_image_data = body.get("reference_image") or body.get("image_url")
+            fallback = _image_value(body.get("reference_image")) or _image_value(body.get("image_url"))
+            ref_image_data = [fallback] if fallback else []
 
     if not prompt:
         prompt = "参考此图片并进行生图创作"
@@ -1149,7 +1166,7 @@ async def images_edits(request: Request, _=Depends(auth)):
         aspect_ratio=aspect_ratio,
         response_format=response_format,
         timeout=timeout,
-        reference_image=ref_image_data,
+        images=ref_image_data,
         **{"async": async_mode}
     )
     full_prompt = build_image_prompt(req_obj)
@@ -1157,7 +1174,9 @@ async def images_edits(request: Request, _=Depends(auth)):
     if req_obj.async_:
         return _queue_image(req_obj, full_prompt, ref_image_data)
     try:
-        res, _acc = await asyncio.to_thread(_run_generation, full_prompt, "image", gen_timeout, reference_image=ref_image_data)
+        res, _acc = await asyncio.to_thread(
+            _run_generation, full_prompt, "image", gen_timeout,
+            reference_images=ref_image_data)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc)) from exc
     except MuseGenerationError as exc:

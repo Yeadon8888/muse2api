@@ -26,7 +26,7 @@
   - 内置模型智能别名映射，`gpt-4o`、`gpt-5`、`claude-sonnet-4`、`deepseek-chat` 等常用模型名自动路由。
 - 🎨 **高质量生图与图像编辑（Images Generations & Edits）**
   - 完全兼容 `/v1/images/generations`（文生图）与 `/v1/images/edits`（图生图/参考图编辑）接口。
-  - 支持 `1:1`、`16:9`、`9:16`、`4:3`、`3:4` 等多画幅生成，支持参考图直传与去水印纯净输出。
+  - 支持 `1:1`、`16:9`、`9:16`、`4:3`、`3:4` 等多画幅生成，支持单图或多图参考直传与去水印纯净输出。
   - 支持 `url` 直链或 `b64_json` 两种返回格式，内置纯文本拒答秒级快速检测，杜绝队列死锁。
   - 图生图仅返回本次新生成的媒体：排除上传预览与历史附件，下载绑定选中的结果；参考图上传或提示词发送未确认时明确报错，不再静默返回原图。
 - 🎬 **文生视频 / 图生视频（Videos）**
@@ -195,6 +195,33 @@ curl -X POST "http://localhost:18610/v1/images/generations" \
 }
 ```
 
+多图参考使用 `images` 数组；服务会按数组顺序逐张上传，并在全部附件得到网页确认后才发送提示词：
+
+```bash
+curl -X POST "http://localhost:18610/v1/images/generations" \
+  -H "Authorization: Bearer m2a_your_secret_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "muse-image",
+    "prompt": "结合第一张图的主体与第二张图的配色生成海报",
+    "images": [
+      {"url": "https://example.com/subject.png"},
+      {"url": "https://example.com/style.png"}
+    ],
+    "response_format": "url"
+  }'
+```
+
+`/v1/images/edits` 的 multipart 请求可以重复提交同名的 `image` 字段：
+
+```bash
+curl -X POST "http://localhost:18610/v1/images/edits" \
+  -H "Authorization: Bearer m2a_your_secret_key" \
+  -F "prompt=结合两张参考图生成一张新图" \
+  -F "image=@subject.png" \
+  -F "image=@style.png"
+```
+
 ### 3. 文生视频 / 图生视频（Videos）
 
 - **第一步：创建生成任务**
@@ -302,7 +329,7 @@ python tests/test_media_selection.py
 同步 OpenAI 图片接口仍保留兼容，但 CDN/客户端可能在生成结束前截断长请求。
 生产客户端应使用短提交 + 轮询，而不是延长 HTTP 超时后重复生成：
 
-1. `POST /v1/images/tasks`：JSON 与 `/v1/images/generations` 相同，可用 `reference_image` 传入图生图参考；建议添加稳定的 `Idempotency-Key` 请求头。
+1. `POST /v1/images/tasks`：JSON 与 `/v1/images/generations` 相同，可用 `reference_image` 传入单张参考图，或用 `images` 数组传入多张参考图；建议添加稳定的 `Idempotency-Key` 请求头。
 2. 接收 HTTP 202 和 `id`，每 3 秒调用 `GET /v1/images/tasks/{id}`。
 3. `status=completed` 时读取 `url` 或 `data[0]`；`status=failed` 时显示 `error`。查询失败只重试查询，不要重新 POST 生图。
 4. 相同幂等键及相同输入返回原任务；同键不同输入返回 409；队列满返回 429。一个进程共享一个浏览器，最多接收 8 个未结束图片任务。
