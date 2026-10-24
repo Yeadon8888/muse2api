@@ -45,7 +45,9 @@ import urllib.request
 
 SITE = "https://muse.ai/"
 CDP_PORT = 9333
-ESSENTIAL = ("hatch_sess", "hatch_gw", "hatch_vml", "hatch_native_auth_device")
+# Keep this aligned with engine. hatch_gw is a replaceable routing cache and is
+# commonly absent until the first gateway request; it must not block an import.
+ESSENTIAL = ("hatch_sess", "hatch_vml", "hatch_native_auth_device")
 DOMAIN_HINT = "muse.ai"
 
 

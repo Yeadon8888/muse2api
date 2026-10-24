@@ -82,7 +82,7 @@ $env:MUSE2API_PROXY_SERVER = $proxyUrl
 $env:HTTP_PROXY = $proxyUrl
 $env:HTTPS_PROXY = $proxyUrl
 $env:NO_PROXY = '127.0.0.1,localhost'
-$env:MUSE2API_CONCURRENCY = '1'
+$env:MUSE2API_CONCURRENCY = '2'
 
 $apiOut = Join-Path $runtimeDir 'api.stdout.log'
 $apiErr = Join-Path $runtimeDir 'api.stderr.log'
