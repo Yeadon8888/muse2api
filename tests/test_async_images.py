@@ -90,7 +90,10 @@ async def check(source, home):
     media.write_bytes(b"image fixture bytes")
 
     def generation(prompt, kind, timeout, **kwargs):
-        calls.append((prompt, kind, timeout, kwargs.get("reference_image")))
+        references = kwargs.get("reference_images")
+        if references is None and kwargs.get("reference_image"):
+            references = [kwargs["reference_image"]]
+        calls.append((prompt, kind, timeout, references or []))
         assert release.wait(2), "test worker not released"
         if "FAIL_FIXTURE" in prompt:
             raise module.MuseGenerationError("fixture generation failed")
@@ -161,12 +164,29 @@ async def check(source, home):
         done = await finish(response.json()["task_id"])
         assert done["status"] == "completed"
         assert done["data"][0]["url"].endswith("fixture.png")
-        assert calls[-1][3] == "data:image/png;base64," + base64.b64encode(b"fixture reference").decode()
+        assert calls[-1][3] == ["data:image/png;base64," + base64.b64encode(b"fixture reference").decode()]
         response = await client.post("/v1/images/edits", json={
             "prompt": "edit JSON reference", "async": True, "reference_image": "data:image/png;base64,eA=="})
         assert response.status_code == 202
         assert (await finish(response.json()["task_id"]))["status"] == "completed"
-        assert calls[-1][3] == "data:image/png;base64,eA=="
+        assert calls[-1][3] == ["data:image/png;base64,eA=="]
+        response = await client.post("/v1/images/edits", json={
+            "prompt": "edit two references", "async": True,
+            "images": [
+                {"url": "data:image/png;base64,Zmlyc3Q="},
+                {"image_url": "data:image/png;base64,c2Vjb25k"},
+            ]})
+        assert response.status_code == 202
+        assert (await finish(response.json()["task_id"]))["status"] == "completed"
+        assert calls[-1][3] == [
+            "data:image/png;base64,Zmlyc3Q=", "data:image/png;base64,c2Vjb25k"]
+        response = await client.post("/v1/images/generations", json={
+            "prompt": "generate from two references", "async": True,
+            "images": ["https://example.com/first.png", "https://example.com/second.png"]})
+        assert response.status_code == 202
+        assert (await finish(response.json()["task_id"]))["status"] == "completed"
+        assert calls[-1][3] == [
+            "https://example.com/first.png", "https://example.com/second.png"]
         print("multipart_and_json_reference_forwarding=PASS")
 
         body = {"prompt": "dedicated async request", "reference_image": "data:image/png;base64,eA=="}
