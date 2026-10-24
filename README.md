@@ -31,7 +31,7 @@
   - 图生图仅返回本次新生成的媒体：排除上传预览与历史附件，下载绑定选中的结果；参考图上传或提示词发送未确认时明确报错，不再静默返回原图。
 - 🎬 **文生视频 / 图生视频（Videos）**
   - 原生对接 Muse 顶配视频生成模型，可传递 5 秒 / 6 秒 / 8 秒 / 10 秒的时长请求（实际成片时长以 Muse 上游输出为准）及 `9:16` 竖屏 / `16:9` 横屏视频生成。
-  - 支持上传首帧参考图（Data URL / HTTP URL）进行严格首帧图生视频创作。
+  - 支持上传单张首帧参考图，或通过 `images` 数组上传多张内容与风格参考图；多图模式以第一张作为主要起始画面。
   - 异步任务架构（`/v1/videos` 创建任务 + `/v1/videos/{task_id}` 状态轮询）。
   - 内置媒体资源服务 `/v1/media/{filename}`，自动持久化存储生成的 MP4 / WebP 资源。
 - ⚡ **真多账号并行并发（Multi-Account Parallel Execution）**
@@ -236,6 +236,22 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
     }'
   ```
   返回任务 ID：`{"id": "task_xyz789", "status": "queued"}`
+
+  多图参考视频在同一个请求中使用有序的 `images` 数组：
+  ```bash
+  curl -X POST "http://localhost:18610/v1/videos" \
+    -H "Authorization: Bearer m2a_your_secret_key" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "prompt": "让第一张图的主体在第二张图的场景与配色中运动",
+      "images": [
+        {"url": "https://example.com/start.png"},
+        {"url": "https://example.com/style.png"}
+      ],
+      "duration": 6,
+      "size": "16:9"
+    }'
+  ```
 
 - **第二步：轮询任务进度**
   ```bash
