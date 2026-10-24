@@ -433,6 +433,7 @@ class VideoRequest(BaseModel):
     timeout: int | None = None
     extra: str | None = None
     image: Any = None
+    images: list | None = None
     image_url: Any = None
     reference_image: str | None = None
 
@@ -505,6 +506,18 @@ def _image_value(value: Any) -> str | None:
 def _image_references(req: ImageRequest) -> list[str]:
     """Preserve the caller's reference-image order without reinterpreting payloads."""
     primary = _image_value(req.reference_image) or _image_value(req.image)
+    if primary:
+        return [primary]
+    return [ref for value in (req.images or []) if (ref := _image_value(value))]
+
+
+def _video_references(req: VideoRequest) -> list[str]:
+    """Keep legacy single-frame fields while allowing ordered content references."""
+    primary = (
+        _image_value(req.reference_image)
+        or _image_value(req.image_url)
+        or _image_value(req.image)
+    )
     if primary:
         return [primary]
     return [ref for value in (req.images or []) if (ref := _image_value(value))]
@@ -741,24 +754,32 @@ def build_video_prompt(r: VideoRequest) -> str:
     ar = (r.aspect_ratio or "").strip().lower()
     sz = (r.size or "").strip().lower()
     dur = r.duration or 6
-    has_ref = bool(r.reference_image or r.image or r.image_url)
+    refs = _video_references(r)
+    has_ref = bool(refs)
+    reference_instruction = (
+        f"基于我本次上传的 {len(refs)} 张参考图片生成视频（以第一张作为主要起始画面，"
+        "其余图片作为主体、场景与风格参考，严禁使用历史图片或其他图像）"
+        if len(refs) > 1 else
+        "基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，"
+        "必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）"
+    )
 
     is_vertical = any(k in ar or k in sz for k in ("9:16", "9/16", "portrait", "竖屏", "720x1280", "1080x1920"))
 
     parts = []
     if is_vertical:
         if has_ref:
-            parts.append(f"基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）：生成一个严格9:16竖屏手机满屏的动态图生视频（9:16 vertical portrait video，720x1280，高大于宽的手机全屏竖版画面，严格以附带的参考图为起始第一帧延续动作，严禁生成横屏或黑边，时长严格为 {dur} 秒）：{user_prompt}")
+            parts.append(f"{reference_instruction}：生成一个严格9:16竖屏手机满屏的动态图生视频（9:16 vertical portrait video，720x1280，高大于宽的手机全屏竖版画面，严禁生成横屏或黑边，时长严格为 {dur} 秒）：{user_prompt}")
         else:
             parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个严格9:16竖屏手机满屏视频（9:16 vertical portrait video，720x1280，高大于宽的手机全屏竖版画面，严禁生成横屏或带有左右黑边，保持垂直构图，时长严格为 {dur} 秒）：{user_prompt}")
     elif any(k in ar or k in sz for k in ("16:9", "16/9", "landscape", "横屏", "1280x720", "1920x1080")):
         if has_ref:
-            parts.append(f"基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）：生成一个16:9宽屏横屏图生视频（16:9 widescreen landscape video，严格以附带的参考图为起始第一帧延续动作，时长严格为 {dur} 秒）：{user_prompt}")
+            parts.append(f"{reference_instruction}：生成一个16:9宽屏横屏图生视频（16:9 widescreen landscape video，时长严格为 {dur} 秒）：{user_prompt}")
         else:
             parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个16:9横屏宽屏视频（16:9 widescreen landscape video，时长严格为 {dur} 秒）：{user_prompt}")
     else:
         if has_ref:
-            parts.append(f"基于我本次上传的参考图片附件作为第一帧参考图（严禁使用历史图片或任何其他图像，必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）：生成动态图生视频（严格以附带的参考图为起始第一帧延续动作，时长严格为 {dur} 秒）：{user_prompt}")
+            parts.append(f"{reference_instruction}：生成动态图生视频（时长严格为 {dur} 秒）：{user_prompt}")
         else:
             parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个视频（时长严格为 {dur} 秒）：{user_prompt}")
 
@@ -1189,13 +1210,7 @@ async def images_edits(request: Request, _=Depends(auth)):
 @app.post("/v1/videos")
 @app.post("/v1/videos/generations")
 async def create_video(req: VideoRequest, _=Depends(auth)):
-    ref_img = None
-    if req.reference_image:
-        ref_img = req.reference_image
-    elif req.image_url:
-        ref_img = req.image_url if isinstance(req.image_url, str) else (req.image_url.get("url") if isinstance(req.image_url, dict) else None)
-    elif req.image:
-        ref_img = req.image.get("url") if isinstance(req.image, dict) else req.image
+    ref_images = _video_references(req)
 
     prompt = build_video_prompt(req)
     timeout = req.timeout or CFG.video_timeout
@@ -1213,7 +1228,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
             def prog_cb(p):
                 store.update_task(task["id"], progress=p)
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
-                                          reference_image=ref_img, on_acquired=_on_acquired)
+                                          reference_images=ref_images, on_acquired=_on_acquired)
             vurl = media_url(res["filename"])
             store.update_task(task["id"], status="completed", progress=100, account=acc_id,
                               elapsed=round(time.time() - timing["t0"], 1),

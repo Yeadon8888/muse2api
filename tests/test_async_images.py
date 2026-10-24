@@ -189,6 +189,24 @@ async def check(source, home):
             "https://example.com/first.png", "https://example.com/second.png"]
         print("multipart_and_json_reference_forwarding=PASS")
 
+        response = await client.post("/v1/videos", json={
+            "prompt": "animate two references", "duration": 6,
+            "images": ["https://example.com/start.png", "https://example.com/style.png"]})
+        assert response.status_code == 200
+        video_id = response.json()["task_id"]
+        for _ in range(100):
+            video = await client.get("/v1/videos/" + video_id)
+            assert video.status_code == 200
+            if video.json()["status"] in ("completed", "failed"):
+                break
+            await asyncio.sleep(0.01)
+        assert video.json()["status"] == "completed"
+        assert calls[-1][1] == "video"
+        assert calls[-1][3] == [
+            "https://example.com/start.png", "https://example.com/style.png"]
+        assert "2 张参考图片" in calls[-1][0]
+        print("multi_reference_video_forwarding=PASS")
+
         body = {"prompt": "dedicated async request", "reference_image": "data:image/png;base64,eA=="}
         response = await client.post("/v1/images/tasks", json=body, headers={"Idempotency-Key": "fixture-key"})
         assert response.status_code == 202
