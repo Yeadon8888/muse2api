@@ -62,3 +62,4 @@ Thumbs.db
 *.tar
 .runtime/
 .venv/
+node_modules/
