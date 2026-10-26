@@ -1129,6 +1129,26 @@ class MuseEngine:
         return None
 
     @staticmethod
+    def _image_mime(data: bytes, declared: str = "") -> str:
+        """Return a browser-safe image MIME, preferring bytes over generic headers."""
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if data.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if data.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+        if len(data) >= 12 and data[4:8] == b"ftyp":
+            brand = data[8:12]
+            if brand in (b"avif", b"avis"):
+                return "image/avif"
+            if brand in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"):
+                return "image/heic"
+        normalized = (declared or "").split(";", 1)[0].strip().lower()
+        return normalized if normalized.startswith("image/") else "image/png"
+
+    @staticmethod
     def _normalize_image(img: str) -> tuple[str, str]:
         """将各种形态的图片输入归一为 (base64_str, mime_type)。"""
         if not img:
@@ -1139,14 +1159,19 @@ class MuseEngine:
             mime = "image/png"
             if ";" in parts[0]:
                 mime = parts[0].split(";")[0].replace("data:", "").strip()
-            return (parts[1].strip() if len(parts) > 1 else ""), mime
+            encoded = parts[1].strip() if len(parts) > 1 else ""
+            try:
+                sample = base64.b64decode(encoded[:128] + "===", validate=False)
+            except Exception:
+                sample = b""
+            return encoded, MuseEngine._image_mime(sample, mime)
         if img.startswith("http://") or img.startswith("https://"):
             try:
                 req = urllib.request.Request(img, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     data = resp.read()
                     mime = resp.headers.get_content_type() or "image/png"
-                    return base64.b64encode(data).decode("ascii"), mime
+                    return base64.b64encode(data).decode("ascii"), MuseEngine._image_mime(data, mime)
             except Exception as e:
                 log.warning("下载远程参考图失败: %s", e)
                 return "", "image/png"
@@ -1155,7 +1180,7 @@ class MuseEngine:
                 with open(img, "rb") as f:
                     data = f.read()
                     mime = mimetypes.guess_type(img)[0] or "image/png"
-                    return base64.b64encode(data).decode("ascii"), mime
+                    return base64.b64encode(data).decode("ascii"), MuseEngine._image_mime(data, mime)
             except Exception as e:
                 log.warning("读取本地参考图失败: %s", e)
                 return "", "image/png"

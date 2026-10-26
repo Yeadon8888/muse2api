@@ -4,6 +4,8 @@ FROM python:3.11-slim-bookworm
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     MUSE2API_HOME=/app \
+    MUSE2API_HOME_DIR=/app/data \
+    MUSE2API_PROFILE_ROOT=/app/data/profiles \
     MUSE2API_HOST=0.0.0.0 \
     MUSE2API_PORT=18610 \
     MUSE2API_CHROMIUM=/usr/bin/chromium \
@@ -17,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-wqy-zenhei \
     fonts-freefont-ttf \
     procps \
+    nodejs \
     curl \
     git \
     ca-certificates \
@@ -32,6 +35,8 @@ COPY deploy/ ./deploy/
 COPY extension/ ./extension/
 COPY tools/ ./tools/
 
+RUN chmod +x /app/deploy/railway/start.sh
+
 # 创建持久化数据目录
 RUN mkdir -p /app/data/media /app/data/downloads /root/muse2api-profiles
 
@@ -39,4 +44,4 @@ VOLUME ["/app/data"]
 
 EXPOSE 18610
 
-CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "18610"]
+CMD ["/app/deploy/railway/start.sh"]

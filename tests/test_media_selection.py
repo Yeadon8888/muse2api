@@ -58,13 +58,15 @@ with tempfile.TemporaryDirectory(prefix='muse-media-test-', dir=Path.home(), ign
         e.target.closest('form').appendChild(b);
       }
     });''')
+  octet_stream_mime=engine._normalize_image(
+    'data:application/octet-stream;base64,iVBORw0KGgo=')[1]
   engine._normalize_image=lambda value:('eA==','image/png')
   engine._attach_images(['first','second'])
   multi_reference_uploaded=page.js("document.querySelectorAll('button[aria-label=\"Remove attachment\"]').length")
   engine._normalize_image=lambda _:('', 'image/png')
   try:engine._attach_image('bad-reference'); rejected=False
   except module.MuseGenerationError:rejected=True
-  result={'upload_only_accepted':len(upload)>0,'result_sources':[a['src'] for a in atts], 'extract_b64':extracted.get('b64'),'stale_selected':selected['src'],'video_selected':video['vSrc'],'fallback_video_rejected':fallback_video_rejected,'tid_video_cover_rejected':tid_video_cover_rejected,'global_download_clicked':global_click,'invalid_reference_rejected':rejected,'multi_reference_uploaded':multi_reference_uploaded}
+  result={'upload_only_accepted':len(upload)>0,'result_sources':[a['src'] for a in atts], 'extract_b64':extracted.get('b64'),'stale_selected':selected['src'],'video_selected':video['vSrc'],'fallback_video_rejected':fallback_video_rejected,'tid_video_cover_rejected':tid_video_cover_rejected,'global_download_clicked':global_click,'invalid_reference_rejected':rejected,'multi_reference_uploaded':multi_reference_uploaded,'octet_stream_mime':octet_stream_mime}
   print(json.dumps(result,sort_keys=True))
   if '--observe' not in sys.argv:
    assert not result['upload_only_accepted']
@@ -75,6 +77,7 @@ with tempfile.TemporaryDirectory(prefix='muse-media-test-', dir=Path.home(), ign
    assert result['fallback_video_rejected']
    assert result['tid_video_cover_rejected']
    assert not global_click and rejected and multi_reference_uploaded==2
-   print('PASS: input preview excluded; exact selected bytes; all old sources ignored; video retained; crossmodal fallback rejected; tid-video cover rejected; scoped download; multi-reference upload; upload failure closed')
+   assert octet_stream_mime=='image/png'
+   print('PASS: input preview excluded; exact selected bytes; all old sources ignored; video retained; crossmodal fallback rejected; tid-video cover rejected; scoped download; multi-reference upload; MIME sniffing; upload failure closed')
  finally:
   engine.stop()

@@ -1,0 +1,15 @@
+.git
+.github
+.runtime
+.venv
+__pycache__
+*.pyc
+*.log
+.env
+.env.*
+data/accounts.json
+data/tasks.json
+data/media/*
+data/downloads/*
+muse2api-profiles
+chrome-profile
