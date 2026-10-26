@@ -31,6 +31,7 @@ import io
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import threading
@@ -1578,14 +1579,28 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     return envelope("completed", text)
 
 
-@app.get("/v1/media/{name}")
+_MEDIA_TYPES = {
+    ".avif": "image/avif",
+    ".gif": "image/gif",
+    ".heic": "image/heic",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".mp4": "video/mp4",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+
+@app.api_route("/v1/media/{name}", methods=["GET", "HEAD"])
 def get_media(name: str):
     if "/" in name or "\\" in name or ".." in name:
         raise HTTPException(400, "非法文件名")
     p = os.path.join(CFG.media_dir, name)
     if not os.path.isfile(p):
         raise HTTPException(404, "文件不存在")
-    return FileResponse(p)
+    ext = os.path.splitext(name)[1].lower()
+    media_type = _MEDIA_TYPES.get(ext) or mimetypes.guess_type(name)[0]
+    return FileResponse(p, media_type=media_type or "application/octet-stream")
 
 
 # ------------------------- 管理：总览 -------------------------
