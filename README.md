@@ -286,6 +286,7 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
 | `MUSE2API_MEDIA_PUBLIC_BASE` | `空` | 对外媒体 URL 前缀，可指向提供 R2 读取能力的 Worker |
 | `MUSE2API_MEDIA_UPLOAD_URL` | `空` | 生成后上传媒体的内部网关地址；留空时仅保存本地卷 |
 | `MUSE2API_MEDIA_UPLOAD_TOKEN` | `空` | 内部媒体上传令牌，必须通过 Secret 注入 |
+| `MUSE2API_MEDIA_LOCAL_RETENTION` | `1` | 设为 `0` 时，R2 上传成功后删除本地媒体，只保留账号、任务与浏览器状态 |
 | `MUSE2API_IMAGE_TIMEOUT` | `240` | 生图超时上限（秒） |
 | `MUSE2API_VIDEO_TIMEOUT` | `600` | 生视频超时上限（秒） |
 | `MUSE2API_CHAT_TIMEOUT` | `300` | 对话生成超时上限（秒） |

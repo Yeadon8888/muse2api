@@ -102,6 +102,8 @@ class Config:
         default_factory=lambda: _env("MUSE2API_MEDIA_UPLOAD_URL", ""))
     media_upload_token: str = field(
         default_factory=lambda: _env("MUSE2API_MEDIA_UPLOAD_TOKEN", ""))
+    media_local_retention: bool = field(
+        default_factory=lambda: _env("MUSE2API_MEDIA_LOCAL_RETENTION", "1").strip() != "0")
 
     # 允许跨域调用导入接口的来源（Cookie 助手脚本从 muse.ai 页面提交时用）
     cors_origins: str = field(

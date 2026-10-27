@@ -2147,7 +2147,8 @@ async function loadStatus(){
     $('pBr').innerHTML = `<span class="led"></span>浏览器 <b>${d.browser_running ? '运行中' : '空闲'}</b>`;
     $('sMedia').textContent = d.media_count ?? 0;
     $('sConc').textContent = `${d.concurrency?.active ?? 0} / ${d.concurrency?.limit ?? 0}`;
-    $('sStorage').textContent = d.config?.media_storage === 'r2+volume' ? 'R2 + 卷' : '本地卷';
+    $('sStorage').textContent = d.config?.media_storage === 'r2' ? 'R2' :
+      (d.config?.media_storage === 'r2+volume' ? 'R2 + 卷' : '本地卷');
     if (d.base_url){ $('dBase').textContent = d.base_url; $('inBase').value = d.base_url; }
   }catch(e){
     if (authOK === false){

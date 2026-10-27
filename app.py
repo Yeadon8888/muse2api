@@ -821,6 +821,14 @@ _MEDIA_TYPES = {
     ".webm": "video/webm",
     ".webp": "image/webp",
 }
+_MEDIA_LIST_CACHE = {"at": 0.0, "items": None}
+_MEDIA_LIST_CACHE_LOCK = threading.Lock()
+
+
+def _invalidate_media_list_cache():
+    with _MEDIA_LIST_CACHE_LOCK:
+        _MEDIA_LIST_CACHE["at"] = 0.0
+        _MEDIA_LIST_CACHE["items"] = None
 
 
 def _media_type(name: str, preferred: str | None = None) -> str:
@@ -847,6 +855,13 @@ def _mirror_media(result: dict) -> bool:
                 timeout=120)
         response.raise_for_status()
         result["storage"] = "r2"
+        _invalidate_media_list_cache()
+        if not CFG.media_local_retention:
+            try:
+                os.remove(path)
+                result["path"] = None
+            except OSError as exc:
+                log.warning("R2 已写入但清理 Railway 临时媒体失败 %s: %s", name, exc)
         return True
     except Exception as exc:  # noqa: BLE001
         result["storage"] = "local"
@@ -854,20 +869,45 @@ def _mirror_media(result: dict) -> bool:
         return False
 
 
-def _delete_mirrored_media(name: str) -> str | None:
+def _delete_mirrored_media(name: str) -> tuple[bool, str | None]:
     upload_base = (CFG.media_upload_url or "").rstrip("/")
     token = CFG.media_upload_token or ""
     if not upload_base or not token:
-        return None
+        return False, None
     try:
         response = requests.delete(
             f"{upload_base}/{quote(name, safe='')}",
             headers={"x-muse-media-token": token}, timeout=30)
         response.raise_for_status()
-        return None
+        _invalidate_media_list_cache()
+        return True, None
     except Exception as exc:  # noqa: BLE001
         log.warning("删除 R2 媒体失败 %s: %s", name, exc)
-        return str(exc)
+        return True, str(exc)
+
+
+def _list_mirrored_media() -> list[dict] | None:
+    upload_base = (CFG.media_upload_url or "").rstrip("/")
+    token = CFG.media_upload_token or ""
+    if not upload_base or not token:
+        return None
+    with _MEDIA_LIST_CACHE_LOCK:
+        cached = _MEDIA_LIST_CACHE["items"]
+        if cached is not None and time.monotonic() - _MEDIA_LIST_CACHE["at"] < 15:
+            return list(cached)
+    try:
+        response = requests.get(upload_base,
+                                headers={"x-muse-media-token": token}, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+        items = payload.get("objects", []) if isinstance(payload, dict) else []
+        with _MEDIA_LIST_CACHE_LOCK:
+            _MEDIA_LIST_CACHE["at"] = time.monotonic()
+            _MEDIA_LIST_CACHE["items"] = list(items)
+        return items
+    except Exception as exc:  # noqa: BLE001
+        log.warning("读取 R2 媒体列表失败，回退 Railway 持久卷: %s", exc)
+        return None
 
 
 # ------------------------- cookie 解析 -------------------------
@@ -1091,8 +1131,14 @@ def _image_response(req: ImageRequest, res: dict) -> dict:
             "size": req.size or "auto", "kind": res["kind"], "bytes": res["size"]}
     if req.response_format == "b64_json":
         fpath = res.get("path") or os.path.join(CFG.media_dir, res["filename"])
-        with open(fpath, "rb") as f:
-            item["b64_json"] = base64.b64encode(f.read()).decode()
+        if os.path.isfile(fpath):
+            with open(fpath, "rb") as f:
+                payload = f.read()
+        else:
+            response = requests.get(media_url(res["filename"]), timeout=120)
+            response.raise_for_status()
+            payload = response.content
+        item["b64_json"] = base64.b64encode(payload).decode()
         item.pop("url", None)
     return {"created": int(time.time()), "data": [item]}
 
@@ -1662,12 +1708,13 @@ def get_media(name: str):
 @app.get("/admin/status")
 def admin_status(_=Depends(auth)):
     base = _public_base()
+    local_media_count = len(os.listdir(CFG.media_dir)) if os.path.isdir(CFG.media_dir) else 0
+    mirrored_media = _list_mirrored_media() if CFG.media_upload_url else None
     return {
         "accounts": store.list_accounts(),
         "stats": store.stats(),
         "tasks": store.list_tasks(20),
-        "media_count": len(os.listdir(CFG.media_dir))
-        if os.path.isdir(CFG.media_dir) else 0,
+        "media_count": len(mirrored_media) if mirrored_media is not None else local_media_count,
         "browser_running": bool(engine.proc and engine.proc.poll() is None),
         "concurrency": {"limit": GEN_LOCK.limit,
                         "active": GEN_LOCK.active_count,
@@ -1678,7 +1725,8 @@ def admin_status(_=Depends(auth)):
                    "image_timeout": CFG.image_timeout,
                    "video_timeout": CFG.video_timeout,
                    "max_concurrency": CFG.max_concurrency,
-                   "media_storage": "r2+volume" if CFG.media_upload_url else "volume",
+                   "media_storage": ("r2+volume" if CFG.media_local_retention else "r2")
+                   if CFG.media_upload_url else "volume",
                    "host": CFG.host, "port": CFG.port,
                    "public_base": base},
     }
@@ -1988,16 +2036,33 @@ def clear_tasks(payload: dict = Body(default={}), _=Depends(auth)):
 @app.get("/admin/media")
 def admin_media(_=Depends(auth)):
     d = CFG.media_dir
-    items = []
+    by_name = {}
     if os.path.isdir(d):
         for name in os.listdir(d):
             p = os.path.join(d, name)
             if not os.path.isfile(p):
                 continue
             ext = os.path.splitext(name)[1].lower()
-            items.append({"name": name, "url": media_url(name), "bytes": os.path.getsize(p),
-                          "mtime": int(os.path.getmtime(p)),
-                          "kind": "video" if ext in (".mp4", ".webm", ".mov") else "image"})
+            by_name[name] = {"name": name, "url": media_url(name), "bytes": os.path.getsize(p),
+                             "mtime": int(os.path.getmtime(p)), "storage": "volume",
+                             "kind": "video" if ext in (".mp4", ".webm", ".mov") else "image"}
+    mirrored = _list_mirrored_media()
+    if mirrored is not None:
+        for obj in mirrored:
+            name = str(obj.get("name") or "")
+            if not name:
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            uploaded = obj.get("uploaded")
+            try:
+                mtime = int(time.mktime(time.strptime(uploaded[:19], "%Y-%m-%dT%H:%M:%S"))) if uploaded else 0
+            except (TypeError, ValueError):
+                mtime = 0
+            by_name[name] = {"name": name, "url": media_url(name),
+                             "bytes": int(obj.get("bytes") or 0), "mtime": mtime,
+                             "storage": "r2",
+                             "kind": "video" if ext in (".mp4", ".webm", ".mov") else "image"}
+    items = list(by_name.values())
     items.sort(key=lambda x: x["mtime"], reverse=True)
     return {"media": items, "count": len(items)}
 
@@ -2017,15 +2082,18 @@ def delete_media(payload: dict = Body(default={}), _=Depends(auth)):
             errors.append(f"非法文件名: {name}")
             continue
         p = os.path.join(d, name)
+        local_removed = False
         if os.path.isfile(p):
             try:
                 os.remove(p)
-                remote_error = _delete_mirrored_media(name)
-                if remote_error:
-                    errors.append(f"{name} R2: {remote_error}")
-                removed += 1
+                local_removed = True
             except OSError as e:
                 errors.append(f"{name}: {str(e)}")
+        remote_attempted, remote_error = _delete_mirrored_media(name)
+        if remote_error:
+            errors.append(f"{name} R2: {remote_error}")
+        if local_removed or (remote_attempted and not remote_error):
+            removed += 1
     return {"removed": removed, "errors": errors}
 
 
@@ -2034,13 +2102,16 @@ def delete_single_media(name: str, _=Depends(auth)):
     if "/" in name or "\\" in name or ".." in name:
         raise HTTPException(400, "非法文件名")
     p = os.path.join(CFG.media_dir, name)
-    if not os.path.isfile(p):
-        raise HTTPException(404, "文件不存在")
     try:
-        os.remove(p)
-        remote_error = _delete_mirrored_media(name)
+        local_removed = False
+        if os.path.isfile(p):
+            os.remove(p)
+            local_removed = True
+        remote_attempted, remote_error = _delete_mirrored_media(name)
         if remote_error:
             raise HTTPException(502, f"本地已删除，但 R2 删除失败: {remote_error}")
+        if not local_removed and not remote_attempted:
+            raise HTTPException(404, "文件不存在")
         return {"status": "ok", "deleted": name}
     except OSError as e:
         raise HTTPException(500, f"删除失败: {e}")
