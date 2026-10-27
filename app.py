@@ -38,6 +38,9 @@ import threading
 import time
 import uuid
 import zipfile
+from urllib.parse import quote
+
+import requests
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -112,6 +115,11 @@ class ConcurrencyLock:
     def locked(self) -> bool:
         with self._count_lock:
             return self._active_count > 0
+
+    @property
+    def active_count(self) -> int:
+        with self._count_lock:
+            return self._active_count
 
     def __enter__(self):
         self.acquire()
@@ -798,8 +806,68 @@ def media_url(name: str) -> str:
     平台）拿到 data[].url 后一般会直接渲染或下载，相对路径会被解析到客户端
     自己的域名上，导致 404。public_base 为空时退回相对路径。
     """
-    base = _public_base()
+    base = (CFG.media_public_base or _public_base()).rstrip("/")
     return f"{base}/v1/media/{name}" if base else f"/v1/media/{name}"
+
+
+_MEDIA_TYPES = {
+    ".avif": "image/avif",
+    ".gif": "image/gif",
+    ".heic": "image/heic",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".mp4": "video/mp4",
+    ".png": "image/png",
+    ".webm": "video/webm",
+    ".webp": "image/webp",
+}
+
+
+def _media_type(name: str, preferred: str | None = None) -> str:
+    if preferred and preferred != "application/octet-stream":
+        return preferred
+    ext = os.path.splitext(name)[1].lower()
+    return _MEDIA_TYPES.get(ext) or mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+
+def _mirror_media(result: dict) -> bool:
+    """Mirror one completed local file to the configured object-storage gateway."""
+    upload_base = (CFG.media_upload_url or "").rstrip("/")
+    token = CFG.media_upload_token or ""
+    name = os.path.basename(str(result.get("filename") or ""))
+    path = result.get("path") or (os.path.join(CFG.media_dir, name) if name else "")
+    if not upload_base or not token or not name or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as media:
+            response = requests.put(
+                f"{upload_base}/{quote(name, safe='')}", data=media,
+                headers={"x-muse-media-token": token,
+                         "content-type": _media_type(name, result.get("mime"))},
+                timeout=120)
+        response.raise_for_status()
+        result["storage"] = "r2"
+        return True
+    except Exception as exc:  # noqa: BLE001
+        result["storage"] = "local"
+        log.warning("媒体镜像到 R2 失败，继续使用 Railway 持久卷 %s: %s", name, exc)
+        return False
+
+
+def _delete_mirrored_media(name: str) -> str | None:
+    upload_base = (CFG.media_upload_url or "").rstrip("/")
+    token = CFG.media_upload_token or ""
+    if not upload_base or not token:
+        return None
+    try:
+        response = requests.delete(
+            f"{upload_base}/{quote(name, safe='')}",
+            headers={"x-muse-media-token": token}, timeout=30)
+        response.raise_for_status()
+        return None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("删除 R2 媒体失败 %s: %s", name, exc)
+        return str(exc)
 
 
 # ------------------------- cookie 解析 -------------------------
@@ -973,6 +1041,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                                       timeout=remaining, expires=cur_acc.get("cookies_exp"),
                                       account_id=cur_acc["id"], on_progress=on_progress,
                                       reference_image=reference_image, **engine_kwargs)
+                _mirror_media(res)
                 store.mark(cur_acc["id"], True, "")
                 _sync_cookies(cur_acc["id"])
                 return res, cur_acc["id"]
@@ -1579,18 +1648,6 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     return envelope("completed", text)
 
 
-_MEDIA_TYPES = {
-    ".avif": "image/avif",
-    ".gif": "image/gif",
-    ".heic": "image/heic",
-    ".jpeg": "image/jpeg",
-    ".jpg": "image/jpeg",
-    ".mp4": "video/mp4",
-    ".png": "image/png",
-    ".webp": "image/webp",
-}
-
-
 @app.api_route("/v1/media/{name}", methods=["GET", "HEAD"])
 def get_media(name: str):
     if "/" in name or "\\" in name or ".." in name:
@@ -1598,9 +1655,7 @@ def get_media(name: str):
     p = os.path.join(CFG.media_dir, name)
     if not os.path.isfile(p):
         raise HTTPException(404, "文件不存在")
-    ext = os.path.splitext(name)[1].lower()
-    media_type = _MEDIA_TYPES.get(ext) or mimetypes.guess_type(name)[0]
-    return FileResponse(p, media_type=media_type or "application/octet-stream")
+    return FileResponse(p, media_type=_media_type(name))
 
 
 # ------------------------- 管理：总览 -------------------------
@@ -1614,11 +1669,16 @@ def admin_status(_=Depends(auth)):
         "media_count": len(os.listdir(CFG.media_dir))
         if os.path.isdir(CFG.media_dir) else 0,
         "browser_running": bool(engine.proc and engine.proc.poll() is None),
+        "concurrency": {"limit": GEN_LOCK.limit,
+                        "active": GEN_LOCK.active_count,
+                        "busy_accounts": len(ACCOUNT_POOL.busy_accounts)},
         "essential_cookies": list(ESSENTIAL_COOKIES),
         "base_url": f"{base}/v1" if base else "",
         "config": {"site": CFG.site_url, "cdp_port": CFG.cdp_port,
                    "image_timeout": CFG.image_timeout,
                    "video_timeout": CFG.video_timeout,
+                   "max_concurrency": CFG.max_concurrency,
+                   "media_storage": "r2+volume" if CFG.media_upload_url else "volume",
                    "host": CFG.host, "port": CFG.port,
                    "public_base": base},
     }
@@ -1960,6 +2020,9 @@ def delete_media(payload: dict = Body(default={}), _=Depends(auth)):
         if os.path.isfile(p):
             try:
                 os.remove(p)
+                remote_error = _delete_mirrored_media(name)
+                if remote_error:
+                    errors.append(f"{name} R2: {remote_error}")
                 removed += 1
             except OSError as e:
                 errors.append(f"{name}: {str(e)}")
@@ -1975,6 +2038,9 @@ def delete_single_media(name: str, _=Depends(auth)):
         raise HTTPException(404, "文件不存在")
     try:
         os.remove(p)
+        remote_error = _delete_mirrored_media(name)
+        if remote_error:
+            raise HTTPException(502, f"本地已删除，但 R2 删除失败: {remote_error}")
         return {"status": "ok", "deleted": name}
     except OSError as e:
         raise HTTPException(500, f"删除失败: {e}")

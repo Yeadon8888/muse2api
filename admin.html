@@ -318,6 +318,8 @@
       <div class="stat r"><div class="k">异常</div><div class="v" id="sBad">0</div></div>
       <div class="stat y"><div class="k">已禁用</div><div class="v" id="sDis">0</div></div>
       <div class="stat"><div class="k">媒体文件</div><div class="v" id="sMedia">0</div></div>
+      <div class="stat b"><div class="k">并发运行</div><div class="v" id="sConc">0 / 0</div></div>
+      <div class="stat g"><div class="k">媒体存储</div><div class="v" id="sStorage" style="font-size:18px">本地卷</div></div>
     </div>
 
     <div class="card">
@@ -2144,6 +2146,8 @@ async function loadStatus(){
     $('pBr').className = 'pill ' + (d.browser_running ? 'on' : 'off');
     $('pBr').innerHTML = `<span class="led"></span>浏览器 <b>${d.browser_running ? '运行中' : '空闲'}</b>`;
     $('sMedia').textContent = d.media_count ?? 0;
+    $('sConc').textContent = `${d.concurrency?.active ?? 0} / ${d.concurrency?.limit ?? 0}`;
+    $('sStorage').textContent = d.config?.media_storage === 'r2+volume' ? 'R2 + 卷' : '本地卷';
     if (d.base_url){ $('dBase').textContent = d.base_url; $('inBase').value = d.base_url; }
   }catch(e){
     if (authOK === false){

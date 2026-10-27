@@ -33,7 +33,7 @@
   - 原生对接 Muse 顶配视频生成模型，可传递 5 秒 / 6 秒 / 8 秒 / 10 秒的时长请求（实际成片时长以 Muse 上游输出为准）及 `9:16` 竖屏 / `16:9` 横屏视频生成。
   - 支持上传单张首帧参考图，或通过 `images` 数组上传多张内容与风格参考图；多图模式以第一张作为主要起始画面。
   - 异步任务架构（`/v1/videos` 创建任务 + `/v1/videos/{task_id}` 状态轮询）。
-  - 内置媒体资源服务 `/v1/media/{filename}`，自动持久化存储生成的 MP4 / WebP 资源。
+  - 内置媒体资源服务 `/v1/media/{filename}`；可选将 MP4 / WebP 双写到 R2 等对象存储，同时保留本地卷作故障回退。
 - ⚡ **真多账号并行并发（Multi-Account Parallel Execution）**
   - 基于 Chromium 原生 `Target.createBrowserContext` 隐身隔离容器，多任务在独立沙箱中并发执行。
   - 多账号同时生图、生视频、流式对话零互相阻塞，Cookie 与 Session 100% 隔离绝不串扰。
@@ -283,6 +283,9 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
 | `MUSE2API_CHROMIUM` | `chromium` | 浏览器可执行程序完整路径 |
 | `MUSE2API_CDP_PORT` | `19210` | 内部 CDP 调试通信端口 |
 | `MUSE2API_CONCURRENCY` | `2` | 最大并发生成任务数（支持随服务器资源自由调高，默认 2） |
+| `MUSE2API_MEDIA_PUBLIC_BASE` | `空` | 对外媒体 URL 前缀，可指向提供 R2 读取能力的 Worker |
+| `MUSE2API_MEDIA_UPLOAD_URL` | `空` | 生成后上传媒体的内部网关地址；留空时仅保存本地卷 |
+| `MUSE2API_MEDIA_UPLOAD_TOKEN` | `空` | 内部媒体上传令牌，必须通过 Secret 注入 |
 | `MUSE2API_IMAGE_TIMEOUT` | `240` | 生图超时上限（秒） |
 | `MUSE2API_VIDEO_TIMEOUT` | `600` | 生视频超时上限（秒） |
 | `MUSE2API_CHAT_TIMEOUT` | `300` | 对话生成超时上限（秒） |
@@ -291,7 +294,7 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
 
 ## 🔒 安全与隐私声明
 
-- **零数据外泄**：本软件全部数据（包括账号凭据、任务队列、媒体文件）均持久化在本地 `data/` 目录中，不依赖任何第三方遥测或外部中转服务。
+- **数据边界明确**：账号凭据与任务队列持久化在 `data/`；媒体默认也保存在本地。只有显式配置媒体上传网关时，生成文件才会双写到所选对象存储。本项目不包含第三方遥测。
 - **开源合规**：本项目仅供技术交流、系统自动化运维研究与自动化测试。请勿将本项目用于违反 Meta 平台服务条款或任何国家法律法规之用途。
 
 ---

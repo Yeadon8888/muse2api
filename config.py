@@ -94,6 +94,15 @@ class Config:
     public_base: str = field(
         default_factory=lambda: _env("MUSE2API_PUBLIC_BASE", ""))
 
+    # 可选的外部媒体镜像。生成结果先写本地持久卷，再上传到该内部端点；
+    # 对外 URL 可指向带 R2 读取能力的 Cloudflare Worker。
+    media_public_base: str = field(
+        default_factory=lambda: _env("MUSE2API_MEDIA_PUBLIC_BASE", ""))
+    media_upload_url: str = field(
+        default_factory=lambda: _env("MUSE2API_MEDIA_UPLOAD_URL", ""))
+    media_upload_token: str = field(
+        default_factory=lambda: _env("MUSE2API_MEDIA_UPLOAD_TOKEN", ""))
+
     # 允许跨域调用导入接口的来源（Cookie 助手脚本从 muse.ai 页面提交时用）
     cors_origins: str = field(
         default_factory=lambda: _env("MUSE2API_CORS_ORIGINS",
