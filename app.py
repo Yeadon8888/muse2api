@@ -55,6 +55,7 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MuseModelRefusalError, RefImageSafetyError, reference_kind)
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
+from media_janitor import MediaJanitor
 from proxy import normalize_server, request_proxy_context, split_proxy_url
 
 import sys
@@ -86,6 +87,7 @@ app.add_middleware(CORSMiddleware,
 
 store = Store(CFG)
 engine = MuseEngine(CFG)
+media_janitor = MediaJanitor(CFG.data_dir, [CFG.media_dir, CFG.download_dir])
 engine.proxy_resolver = lambda aid: (store.get_account(aid) or {}).get("proxy")
 
 
@@ -2490,6 +2492,31 @@ async def _keepalive_loop():
         await asyncio.sleep(900)
 
 
+async def _media_janitor_loop():
+    """后台常驻：按数据卷水位清理最旧的生成媒体，防止磁盘写满。"""
+    log.info("【媒体清理守护进程】已启动：高水位 %.0f%%，低水位 %.0f%%，最短保留 %.0f 分钟，间隔 %.0f 秒",
+             media_janitor.high * 100, media_janitor.low * 100,
+             media_janitor.min_age_s / 60, media_janitor.interval_s)
+    while True:
+        try:
+            await asyncio.to_thread(media_janitor.run_once)
+        except Exception as e:  # noqa: BLE001
+            log.error("【媒体清理守护进程】异常: %s", e)
+        await asyncio.sleep(media_janitor.interval_s)
+
+
+@app.get("/admin/storage")
+def admin_storage(_=Depends(auth)):
+    """数据卷用量、媒体占用与自动清理配置 / 最近一次清理结果。"""
+    return media_janitor.status()
+
+
+@app.post("/admin/storage/cleanup")
+def admin_storage_cleanup(_=Depends(auth)):
+    """立即按水位执行一次清理（未超过高水位时不会删除任何文件）。"""
+    return media_janitor.run_once()
+
+
 @app.post("/admin/accounts/keepalive")
 async def trigger_keepalive_all(force: bool = True, _=Depends(auth)):
     """管理员手动触发一次全账号保活续期。"""
@@ -2848,6 +2875,7 @@ async def _startup():
         _persist_env("MUSE2API_KEY", new_key)
         log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥: %s", new_key)
     asyncio.create_task(_keepalive_loop())
+    asyncio.create_task(_media_janitor_loop())
 
 
 @app.on_event("shutdown")
