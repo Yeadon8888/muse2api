@@ -1698,12 +1698,101 @@ class MuseEngine:
         return 0;
     })()"""
 
+    # 输入框里的「Attach file」按钮；冷页面上 file input 可能在点击后才挂载。
+    _CLICK_ATTACH_JS = "(function(){" + _COMPOSER_ROOTS_JS + """
+        var rx = /attach|附件|上传|upload/i, no = /remove|移除|删除/i;
+        var roots = __composerRoots();
+        for (var r of roots) {
+            var b = Array.from(r.querySelectorAll('button[aria-label]')).find(function(x){
+                var al = x.getAttribute('aria-label') || '';
+                return rx.test(al) && !no.test(al) && !x.disabled;
+            });
+            if (b) { b.click(); return true; }
+        }
+        return false;
+    })()"""
+
+    # 兜底：整页只有唯一一个 file input 时才使用它，避免把素材传到别的位置。
+    _SOLE_FILE_INPUT_JS = """(function(){
+        var inputs = document.querySelectorAll('input[type="file"]');
+        return inputs.length === 1 ? inputs[0] : null;
+    })()"""
+
+    _UPLOAD_DEBUG_JS = "(function(){" + _COMPOSER_ROOTS_JS + """
+        var roots = __composerRoots();
+        var r = roots.length ? roots[roots.length - 1] : null;
+        return JSON.stringify({
+            url: location.href, ready: document.readyState,
+            textareas: document.querySelectorAll('textarea').length,
+            fileInputs: document.querySelectorAll('input[type="file"]').length,
+            composerButtons: r ? Array.from(r.querySelectorAll('button')).map(function(b){
+                return (b.getAttribute('aria-label') || b.innerText || '').trim().slice(0, 40);
+            }).filter(Boolean).slice(0, 20) : [],
+            dialogs: Array.from(document.querySelectorAll('[role=dialog],[role=alertdialog]')).map(function(d){
+                return (d.innerText || '').trim().slice(0, 200);
+            }).slice(0, 3),
+            bodyTail: (document.body ? document.body.innerText : '').trim().slice(-400)
+        });
+    })()"""
+
+    def _eval_object_id(self, expression: str) -> str | None:
+        res = self.page.send("Runtime.evaluate", {
+            "expression": expression, "returnByValue": False})
+        return (res.get("result", {}).get("result", {}) or {}).get("objectId")
+
+    def _wait_file_input(self) -> str | None:
+        """等待输入框里的 file input 出现。
+
+        textarea 可交互时上传控件不一定已挂载（冷页面、刚切号或工作区 VM 仍在唤醒），
+        原来只查一次就报错。这里先轮询，仍没有则点击 Attach 按钮（拦截原生文件对话框）
+        后继续等待，最后才退回到「整页唯一 file input」。
+        """
+        total = max(5.0, float(os.environ.get("MUSE2API_UPLOAD_WAIT", "30")))
+        deadline = time.monotonic() + total
+        click_at = time.monotonic() + min(8.0, total / 3)
+        clicked = False
+        intercepting = False
+        try:
+            while time.monotonic() < deadline:
+                object_id = self._eval_object_id(self._FILE_INPUT_JS)
+                if object_id:
+                    return object_id
+                if not clicked and time.monotonic() >= click_at:
+                    clicked = True
+                    try:
+                        self.page.send("Page.setInterceptFileChooserDialog", {"enabled": True})
+                        intercepting = True
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        if self.page.js(self._CLICK_ATTACH_JS):
+                            log.info("上传控件未就绪，已点击 Attach file 按钮后继续等待")
+                    except Exception:  # noqa: BLE001
+                        pass
+                time.sleep(0.25)
+            return self._eval_object_id(self._SOLE_FILE_INPUT_JS)
+        finally:
+            if intercepting:
+                try:
+                    self.page.send("Page.setInterceptFileChooserDialog", {"enabled": False})
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _dump_upload_debug(self):
+        try:
+            info = self.page.js(self._UPLOAD_DEBUG_JS)
+            path = os.path.join(self.cfg.data_dir, "debug-no-upload-control.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(info if isinstance(info, str) else json.dumps(info, ensure_ascii=False))
+            log.warning("找不到上传控件，页面快照已写入 %s: %s", path, str(info)[:300])
+        except Exception:  # noqa: BLE001
+            pass
+
     def _set_input_files(self, paths: list[str]):
         """用 CDP 直接把磁盘文件交给上传控件（大视频不再经 base64 注入页面）。"""
-        res = self.page.send("Runtime.evaluate", {
-            "expression": self._FILE_INPUT_JS, "returnByValue": False})
-        object_id = (res.get("result", {}).get("result", {}) or {}).get("objectId")
+        object_id = self._wait_file_input()
         if not object_id:
+            self._dump_upload_debug()
             raise MuseGenerationError("找不到上传控件，已停止生成")
         self.page.send("DOM.setFileInputFiles",
                        {"files": paths, "objectId": object_id}, timeout=60)
