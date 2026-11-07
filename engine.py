@@ -678,10 +678,37 @@ class MuseEngine:
             out[name] = {"value": c.get("value", ""), "expires": exp}
         return out
 
-    def _wait_ws_ready(self, page: CDP, timeout: float = 15.0) -> bool:
-        """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。"""
+    CRASH_PAGE_MESSAGE = ("muse.ai 页面加载后崩溃为 Something went wrong（工作区令牌 /api/hatch/token "
+                          "被拒绝，常见于 cookie 不完整或会话已在别处失效），请用浏览器扩展重新导入该账号的完整 cookie")
+
+    _CRASH_PAGE_JS = """(function(){
+        if (document.readyState !== 'complete' || document.querySelector('textarea')) return false;
+        var b = document.body ? (document.body.innerText || '') : '';
+        return /something went wrong/i.test(b) && /try again/i.test(b);
+    })()"""
+
+    def _is_crash_page(self, page: CDP | None = None) -> bool:
+        """muse.ai 的 React 错误页：没有输入框，只剩 Something went wrong / Try again。"""
+        try:
+            return (page or self.page).js(self._CRASH_PAGE_JS) is True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _wait_ws_ready(self, page: CDP, timeout: float = 15.0, fail_on_crash: bool = False) -> bool:
+        """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。
+
+        fail_on_crash: 错误页连续出现 6 秒即提前返回 False，而不是等满 timeout。
+        """
         deadline = time.time() + timeout
+        crash_since = None
         while time.time() < deadline:
+            if fail_on_crash:
+                if self._is_crash_page(page):
+                    crash_since = crash_since or time.time()
+                    if time.time() - crash_since >= 6.0:
+                        return False
+                else:
+                    crash_since = None
             try:
                 st = page.js("""(function(){
                     if (document.readyState !== 'complete') return 'loading';
@@ -784,14 +811,25 @@ class MuseEngine:
         self._ensure_local().proxy_config = proxy
         self._apply_cookies(page, cookies, expires)
         page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
-        if self._wait_ws_ready(page, timeout=self.cfg.login_wait):
+        if self._wait_ws_ready(page, timeout=self.cfg.login_wait, fail_on_crash=True):
+            # A token-rejected session renders the composer briefly, then crashes to
+            # "Something went wrong" within seconds; confirm the page stays usable.
+            stable_until = time.time() + 4.0
+            while time.time() < stable_until:
+                if self._is_crash_page(page):
+                    self._close_page()
+                    raise MuseAuthError(self.CRASH_PAGE_MESSAGE)
+                time.sleep(0.25)
             self.current_acc_id = account_id
             return page
+        crashed = self._is_crash_page(page)
         try:
             body = (page.js("document.body ? document.body.innerText.slice(0,1200) : ''") or "").lower()
         except Exception:
             body = ""
         self._close_page()
+        if crashed:
+            raise MuseAuthError(self.CRASH_PAGE_MESSAGE)
         if proxy and re.search(r"err_(?:proxy|tunnel)|proxy authentication|代理认证失败", body, re.I):
             raise MuseProxyError("账号代理浏览器连接失败，请检查节点或认证；未回退直连")
         if "connecting..." in body:
@@ -1752,11 +1790,19 @@ class MuseEngine:
         click_at = time.monotonic() + min(8.0, total / 3)
         clicked = False
         intercepting = False
+        crash_since = None
         try:
             while time.monotonic() < deadline:
                 object_id = self._eval_object_id(self._FILE_INPUT_JS)
                 if object_id:
                     return object_id
+                if self._is_crash_page():
+                    crash_since = crash_since or time.monotonic()
+                    if time.monotonic() - crash_since >= 3.0:
+                        self._dump_upload_debug()
+                        raise MuseAuthError(self.CRASH_PAGE_MESSAGE)
+                else:
+                    crash_since = None
                 if not clicked and time.monotonic() >= click_at:
                     clicked = True
                     try:

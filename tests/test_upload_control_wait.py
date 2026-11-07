@@ -106,7 +106,24 @@ with tempfile.TemporaryDirectory(prefix="muse-upload-wait-", dir=Path.home()) as
         assert page.js("document.querySelector('#now').files.length") == 1
         assert page.js("document.querySelector('#old').files.length") == 0
         print(json.dumps({"case": "immediate_composer_input"}))
-        print("PASS: late mount, attach-click mount, ambiguous refusal, immediate path")
+        # 5) Token-rejected session: muse.ai's React error page. Fail fast as an auth error
+        #    (so the account is marked unhealthy and skipped) instead of waiting it out.
+        load('<main><div><h2>Something went wrong</h2><button>Try again</button></div></main>')
+        assert engine._is_crash_page() is True
+        t0 = time.monotonic()
+        try:
+            engine._set_input_files([str(upload)])
+        except module.MuseAuthError as e:
+            waited = time.monotonic() - t0
+            assert "Something went wrong" in str(e) and waited < 5.5, (str(e), waited)
+            print(json.dumps({"case": "crash_page_auth_error", "waited_s": round(waited, 2)}))
+        else:
+            raise AssertionError("crash page should raise MuseAuthError")
+
+        # 6) A normal composer is never mistaken for the crash page.
+        load('<main><section><div><textarea></textarea></div></section><p>Try again later</p></main>')
+        assert engine._is_crash_page() is False
+        print("PASS: late mount, attach-click mount, ambiguous refusal, immediate path, crash page")
     finally:
         if page:
             try:

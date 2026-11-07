@@ -163,6 +163,7 @@ class Store:
             live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
             if not live:
                 return None
+            any_healthy = any(a.get("ok") is not False for a in live)
             blocked = set(exclude_ids or [])
             if exclude_id:
                 blocked.add(exclude_id)
@@ -188,6 +189,9 @@ class Store:
                                 _write(self.cfg.accounts_file, self.accounts)
                             return a
             healthy = [a for a in live if a.get("ok") is not False]
+            if not healthy and any_healthy and exclude_ids is not None:
+                # 并发模式：健康账号只是暂时繁忙，等待它释放，而不是派给已判定会话失效的账号。
+                return None
             candidates = healthy if healthy else live
             candidates.sort(key=lambda a: (a.get("last_used") or 0.0, a.get("use_count") or 0))
             acc = candidates[0]
