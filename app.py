@@ -1842,13 +1842,26 @@ def get_media(name: str):
 
 
 # ------------------------- 管理：总览 -------------------------
+_TASK_PROMPT_PREVIEW = 300
+
+
+def _task_summary(task: dict) -> dict:
+    """列表视图用的任务摘要：去掉内部 api_prompt，长提示词截断（完整内容用 full=1 或单任务接口）。"""
+    t = {k: v for k, v in task.items() if k != "api_prompt"}
+    prompt = t.get("prompt")
+    if isinstance(prompt, str) and len(prompt) > _TASK_PROMPT_PREVIEW:
+        t["prompt"] = prompt[:_TASK_PROMPT_PREVIEW] + "…"
+        t["prompt_truncated"] = True
+    return t
+
+
 @app.get("/admin/status")
 def admin_status(_=Depends(auth)):
     base = _public_base()
     return {
         "accounts": store.list_accounts(),
         "stats": store.stats(),
-        "tasks": store.list_tasks(20),
+        "tasks": [_task_summary(t) for t in store.list_tasks(20)],
         "media_count": len(os.listdir(CFG.media_dir))
         if os.path.isdir(CFG.media_dir) else 0,
         "browser_running": bool(engine.proc and engine.proc.poll() is None),
@@ -2243,8 +2256,9 @@ def extension_files():
 
 # ------------------------- 管理：任务 / 媒体 -------------------------
 @app.get("/admin/tasks")
-def admin_tasks(limit: int = 50, _=Depends(auth)):
-    return {"tasks": store.list_tasks(limit)}
+def admin_tasks(limit: int = 50, full: bool = False, _=Depends(auth)):
+    tasks = store.list_tasks(limit)
+    return {"tasks": tasks if full else [_task_summary(t) for t in tasks]}
 
 
 @app.delete("/admin/tasks/{tid}")

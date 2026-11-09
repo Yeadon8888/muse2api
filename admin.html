@@ -2115,16 +2115,26 @@ async function loadMedia(){
       updateMediaSelectionUI();
       return;
     }
-    $('mediaGrid').innerHTML = ms.map(m => {
-      const isSel = _selectedMedia.has(m.name);
-      return `
+    renderMediaGrid();
+  }catch(e){ $('mediaGrid').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+// 媒体库分页渲染：一次性给几百个文件各建一个 <video> 会同时发起数百个视频请求、
+// 创建数百个解码器，慢网络下整页卡死。只渲染当前页，视频不预加载，点击才播放。
+const MEDIA_PAGE_SIZE = 24;
+let _mediaShown = MEDIA_PAGE_SIZE;
+
+function mediaTile(m){
+  const isSel = _selectedMedia.has(m.name);
+  const thumb = m.kind === 'video'
+    ? `<video src="${esc(m.url)}" muted playsinline preload="none" controls></video>`
+    : `<img src="${esc(m.url)}" loading="lazy" decoding="async" alt="">`;
+  return `
       <div class="tile ${isSel ? 'selected' : ''}" data-name="${esc(m.name)}">
         <label class="check-tag" title="勾选以批量操作" onclick="event.stopPropagation()">
           <input type="checkbox" class="tile-check" ${isSel ? 'checked' : ''} onchange="toggleMediaSelect('${esc(m.name)}')">
         </label>
-        <div class="thumb">${m.kind === 'video'
-          ? `<video src="${esc(m.url)}" muted playsinline preload="metadata"></video>`
-          : `<img src="${esc(m.url)}" loading="lazy" alt="">`}</div>
+        <div class="thumb">${thumb}</div>
         <div class="meta">
           <div class="nm" title="${esc(m.name)}">${esc(m.name)}</div>
           <div style="margin-top:3px">${fmtBytes(m.bytes)} · ${fmtTime(m.mtime)}</div>
@@ -2135,9 +2145,22 @@ async function loadMedia(){
           </div>
         </div>
       </div>`;
-    }).join('');
-    updateMediaSelectionUI();
-  }catch(e){ $('mediaGrid').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+function renderMediaGrid(){
+  const ms = _allMedia;
+  const shown = ms.slice(0, _mediaShown);
+  const rest = ms.length - shown.length;
+  $('mediaGrid').innerHTML = shown.map(mediaTile).join('') + (rest > 0
+    ? `<div class="empty" style="grid-column:1/-1">已显示 ${shown.length} / ${ms.length} 个
+         <button class="ghost mini" style="margin-left:8px" onclick="showMoreMedia()">再加载 ${Math.min(rest, MEDIA_PAGE_SIZE)} 个</button></div>`
+    : '');
+  updateMediaSelectionUI();
+}
+
+function showMoreMedia(){
+  _mediaShown += MEDIA_PAGE_SIZE;
+  renderMediaGrid();
 }
 
 /* ================= 在线测试 ================= */
@@ -2369,12 +2392,22 @@ async function loadStatus(){
 function refreshAll(){ loadStatus(); loadPool(); loadApikey(); loadRepoStatus(false); }
 
 refreshAll();
+// 轮询：页面在后台时暂停；上一轮还没返回（慢网络）就跳过本轮，避免请求越积越多。
+let _polling = false;
+async function pollOnce(){
+  if (document.hidden || _polling) return;
+  _polling = true;
+  try {
+    await Promise.allSettled([
+      loadStatus(), loadPool(),
+      $('tab-tasks').classList.contains('active') ? loadTasks() : null,
+    ]);
+  } finally { _polling = false; }
+}
+setInterval(pollOnce, 8000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pollOnce(); });
 setInterval(() => {
-  loadStatus(); loadPool();
-  if ($('tab-tasks').classList.contains('active')) loadTasks();
-}, 8000);
-setInterval(() => {
-  loadRepoStatus(false);
+  if (!document.hidden) loadRepoStatus(false);
 }, 60000);
 </script>
 </body>
