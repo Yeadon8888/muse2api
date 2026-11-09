@@ -2805,13 +2805,27 @@ def _upgrade_from_github_sync() -> dict:
 @app.get("/admin/repo/status")
 async def admin_check_update(force: bool = False):
     """供所有已部署节点实时检测 GitHub 官方仓库是否有新版本更新。"""
-    return await asyncio.to_thread(_check_update_sync, force)
+    status = await asyncio.to_thread(_check_update_sync, force)
+    if os.environ.get("MUSE2API_ALLOW_SELF_UPDATE", "0").strip() != "1" and isinstance(status, dict):
+        # 在线升级已禁用：不再弹出「一键升级」横幅，避免误点导致服务退出。
+        status = dict(status, has_update=False, self_update_disabled=True)
+    return status
 
+
+
+def _ensure_self_update_allowed():
+    """容器内自升级会用上游 main 覆盖镜像代码再 os._exit(0)；在 Railway 等平台上进程正常退出
+    不会被拉起，服务直接 502，且覆盖掉本分支的修复。默认禁用，需显式设置
+    MUSE2API_ALLOW_SELF_UPDATE=1 才允许（仅适合自建、有进程守护的部署）。"""
+    if os.environ.get("MUSE2API_ALLOW_SELF_UPDATE", "0").strip() != "1":
+        raise HTTPException(403, "本部署已禁用在线升级：请通过 GitHub 部署分支更新并由 Railway 重新部署"
+                                 "（如确需启用，设置 MUSE2API_ALLOW_SELF_UPDATE=1）")
 
 @app.post("/admin/update/upgrade")
 @app.post("/admin/repo/pull")
 async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
     """一键从 GitHub 官方仓库拉取最新更新并自动平滑重启服务。"""
+    _ensure_self_update_allowed()
     res = await asyncio.to_thread(_upgrade_from_github_sync)
     restart = payload.get("restart", True) if isinstance(payload, dict) else True
     if restart:
@@ -2829,6 +2843,7 @@ async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
 @app.post("/admin/repo/push")
 async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
     """维护者专用：将当前节点核心代码推送到 GitHub 仓库（自动过滤 .env 与 data 目录）。"""
+    _ensure_self_update_allowed()
     msg = (payload.get("message") or "").strip() or f"chore: sync update ({time.strftime('%Y-%m-%d %H:%M:%S')})"
     new_token = (payload.get("github_token") or "").strip()
     if new_token:
