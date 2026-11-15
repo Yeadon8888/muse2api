@@ -2372,12 +2372,12 @@ def _admin_html() -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return _admin_html()
+    return HTMLResponse(_admin_html(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
-    return _admin_html()
+    return HTMLResponse(_admin_html(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
 
 
 
