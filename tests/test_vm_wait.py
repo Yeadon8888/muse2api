@@ -1,8 +1,10 @@
 import sys,importlib.util,json
 from types import SimpleNamespace
 from pathlib import Path
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-spec=importlib.util.spec_from_file_location('candidate',sys.argv[1]);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT))
+candidate=Path(sys.argv[1]) if len(sys.argv)>1 and not sys.argv[1].startswith('--') else ROOT/'engine.py'
+spec=importlib.util.spec_from_file_location('candidate',candidate);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 clock=[0.0]
 m.time=SimpleNamespace(time=lambda:clock[0],sleep=lambda s:clock.__setitem__(0,clock[0]+s))
 engine=object.__new__(m.MuseEngine)
