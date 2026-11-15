@@ -57,23 +57,26 @@ with tempfile.TemporaryDirectory(prefix='muse-layout-',dir=Path.home()) as home:
     time.sleep(.1)
    raise AssertionError('Condition failed: '+expr)
   wait("document.querySelectorAll('#poolBody tr').length===8")
-  measure="""(()=>{const m=document.querySelector('main'),w=document.querySelector('#poolBody').closest('.tblwrap'),n=document.querySelector('#poolBody td.ellip');return {viewport:innerWidth,mainWidth:m.getBoundingClientRect().width,bodyWidth:document.documentElement.scrollWidth,tableWidth:w.clientWidth,tableScroll:w.scrollWidth,noteDisplay:getComputedStyle(n).display,noteWhiteSpace:getComputedStyle(n).whiteSpace,buttons:document.querySelectorAll('#poolBody tr:first-child button').length}})()"""
+  measure="""(()=>{const m=document.querySelector('main'),w=document.querySelector('#poolBody').closest('.tblwrap'),n=document.querySelector('#poolBody td.ellip');
+  const clipped=e=>{for(let p=e.parentElement;p&&p!==document.body;p=p.parentElement){const x=getComputedStyle(p).overflowX;if(['auto','scroll','hidden','clip'].includes(x))return true}return false};
+  const overflowing=[...document.querySelectorAll('body *')].filter(e=>{const r=e.getBoundingClientRect();return r.width&&r.right>innerWidth+1&&!clipped(e)}).map(e=>{const r=e.getBoundingClientRect();return {selector:e.id?'#'+e.id:e.tagName.toLowerCase()+([...e.classList].length?'.'+[...e.classList].join('.'):''),left:Math.round(r.left),right:Math.round(r.right),width:Math.round(r.width),text:(e.textContent||'').trim().slice(0,80)}});
+  return {viewport:innerWidth,mainWidth:m.getBoundingClientRect().width,bodyWidth:document.documentElement.scrollWidth,tableWidth:w.clientWidth,tableScroll:w.scrollWidth,noteDisplay:getComputedStyle(n).display,noteWhiteSpace:getComputedStyle(n).whiteSpace,buttons:document.querySelectorAll('#poolBody tr:first-child button').length,overflowing}})()"""
   for lang in (['zh'] if args.probe_only else ['zh','en']):
    if lang=='en':
     page.js("localStorage.setItem('muse2api_lang','en');location.reload()");wait("document.querySelectorAll('#poolBody tr').length===8")
-   for width in ([1920] if args.probe_only else [2560,1920,1536,1440,1366,1280,768,390,320]):
+   for width in ([1920] if args.probe_only else [2560,1920,1536,1440,1366,1280,768,390,375,320]):
     page.send('Emulation.setDeviceMetricsOverride',{'width':width,'height':1080,'deviceScaleFactor':1,'mobile':False})
     time.sleep(.15);m=page.js(measure);print(json.dumps({'lang':lang,**m}),flush=True)
     assert m['mainWidth']>=width-24,'Page does not fill the viewport'
-    assert m['bodyWidth']<=width+1,'Page overflows the viewport'
+    assert m['bodyWidth']<=width+1,f'Page overflows the viewport: {m["overflowing"]}'
     if width>=1280:assert m['tableScroll']<=m['tableWidth']+1,'Desktop account controls need horizontal scrolling'
     assert m['noteDisplay']=='table-cell' and m['noteWhiteSpace']=='normal','Notes must retain table-cell layout and wrap'
     assert m['buttons']==8
-    if width==1920 and not args.probe_only and args.screenshots:
-     page.js("document.querySelector('#poolBody').scrollIntoView({block:'end'})")
+    if width in (1440,375) and not args.probe_only and args.screenshots:
+     page.js("document.querySelector('#keepaliveBadge').scrollIntoView({block:'center'})")
      image=page.send('Page.captureScreenshot',{'format':'png'})
      args.screenshots.mkdir(parents=True,exist_ok=True)
-     (args.screenshots/('layout-'+lang+'.png')).write_bytes(base64.b64decode(image['result']['data']))
+     (args.screenshots/(f'layout-{lang}-{width}.png')).write_bytes(base64.b64decode(image['result']['data']))
    if not args.probe_only:
     page.send('Emulation.setDeviceMetricsOverride',{'width':390,'height':844,'deviceScaleFactor':1,'mobile':False})
     page.js("openProxy('fixture00000');$('proxyMode').value='proxy';updateProxyMode();$('proxyServer').value='socks5://draft:draft-secret@127.0.0.1:1081';$('proxyServer').dispatchEvent(new Event('input',{bubbles:true}))")
