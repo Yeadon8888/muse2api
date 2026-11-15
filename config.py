@@ -104,6 +104,14 @@ class Config:
     chat_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_CHAT_TIMEOUT", "300")))
     max_concurrency: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_CONCURRENCY", "2"))))
 
+    # muse.ai 暂未给账号分配工作区时，短暂冷却该账号，避免所有任务反复打开页面。
+    workspace_cooldown_seconds: int = field(
+        default_factory=lambda: max(0, int(_env("MUSE2API_WORKSPACE_COOLDOWN_SECONDS", "300"))))
+    workspace_rediscovery_delay_seconds: float = field(
+        default_factory=lambda: max(0.0, float(_env("MUSE2API_WORKSPACE_REDISCOVERY_DELAY_SECONDS", "15"))))
+    workspace_circuit_breaker_enabled: bool = field(
+        default_factory=lambda: _env("MUSE2API_WORKSPACE_CIRCUIT_BREAKER_ENABLED", "1").strip() != "0")
+
     # 参考图输入默认只允许调用方直接提供数据和公网 URL。
     # 仅可信单用户部署可显式设为 1 恢复服务器本地文件或私网抓取。
     ref_image_local_files: bool = field(

@@ -55,6 +55,9 @@ Railway 数据卷挂载到 `/app/data`。镜像把 `MUSE2API_HOME` 设为 `/app`
 | `MUSE2API_VIDEO_TIMEOUT` | `600` | 视频生成超时，秒 |
 | `MUSE2API_CHAT_TIMEOUT` | `300` | 对话生成超时，秒 |
 | `MUSE2API_CONCURRENCY` | `2` | 全局最大并发任务槽位，最小为 1；同一账号仍不会同时被多个任务占用。调大前确认 Railway 内存、CPU 与账号数足够 |
+| `MUSE2API_WORKSPACE_COOLDOWN_SECONDS` | `300` | 账号遇到工作区未分配后的冷却秒数；冷却期间不参与业务调度，到期自动恢复，不改变账号 `ok` 状态 |
+| `MUSE2API_WORKSPACE_REDISCOVERY_DELAY_SECONDS` | `15` | 首次遇到工作区 no-match 后，关闭页面并再次查询 `/api/session` 前的等待秒数；同一任务、同一账号只重新发现一次且不调用 wake |
+| `MUSE2API_WORKSPACE_CIRCUIT_BREAKER_ENABLED` | `1` | 非 `0` 时启用上游故障熔断；所有可调度账号都在冷却时立即失败，不再打开页面或请求 muse.ai |
 | `MUSE2API_REF_IMAGE_LOCAL_FILES` | `0` | 严格等于 `1` 时才允许服务器本地路径作为参考素材；仅适合可信单用户部署 |
 | `MUSE2API_REF_IMAGE_PRIVATE_FETCH` | `0` | 严格等于 `1` 时才允许抓取私网/本机参考图 URL；默认只允许经过检查的公网 URL |
 | `MUSE2API_TOOL_PROTOCOL` | `0` | 非 `0` 时启用工具调用协议适配；默认只兼容参数，不注入协议 |
@@ -117,6 +120,12 @@ Railway 数据卷挂载到 `/app/data`。镜像把 `MUSE2API_HOME` 设为 `/app`
 muse.ai 会在 `/api/session` 响应中轮换 `hatch_sess`、`hatch_gw` 等 Cookie；即使响应 JSON 的工作区状态不是 `assigned`，旧值也可能已经作废。旧实现先按工作区未分配报错，丢掉响应里的新 Cookie，所以账号常在随后约 10 分钟需要重新导入。
 
 当前实现先合并响应 Cookie 和到期时间并写回 `accounts.json`，再报告工作区未分配；已有 Cookie 中未被轮换的项不会丢失。日志出现“工作区暂未分配，已保留 muse.ai 轮换下发的新 cookie”时，不要用旧 Cookie 覆盖数据卷中的新值。
+
+### 上游故障熔断
+
+页面返回 `hatch_vm_auth_no_match` / `MuseWorkspaceUnavailable` 表示 muse.ai 暂未给该账号分配工作区，不等同于 Cookie 失效。程序会先关闭页面并回存轮换 Cookie，等待 `MUSE2API_WORKSPACE_REDISCOVERY_DELAY_SECONDS` 后，仅用一次无 wake 的 `/api/session` 查询重新发现工作区；只有状态恢复为 `assigned` 才为同一账号重开页面重试一次。
+
+重新发现仍不可用或失败时，账号进入 `MUSE2API_WORKSPACE_COOLDOWN_SECONDS` 冷却。冷却不会修改账号 `ok`，也不需要重新导入 Cookie；`GET /admin/accounts` 的 `workspace_cooldown_remaining_seconds` 可查看剩余秒数。若所有可调度账号都在冷却且熔断开关开启，新任务会立即返回上游故障及预计自动恢复时间，不会启动浏览器或继续请求 muse.ai。应等待冷却自动结束；只有出现明确登录页、`/api/session` 401 等认证证据时才重新导入 Cookie。
 
 ### 常见生成错误
 

@@ -173,6 +173,7 @@ def _check_app_does_not_flip_health():
         err = appmod.MuseWorkspaceUnavailable(appmod.MuseEngine.WORKSPACE_UNAVAILABLE_MESSAGE)
         with _patch.object(appmod.engine, "start"), _patch.object(appmod.engine, "generate", side_effect=err), \
              _patch.object(appmod, "_renew_and_persist", return_value=None), \
+             _patch.object(appmod, "_rediscover_workspace", return_value=False), \
              _patch.object(appmod, "_bind_account_proxy"), _patch.object(appmod.engine, "close_current_page"):
             try:
                 appmod._run_generation("p", "video", timeout=30, account_id=acc["id"])
