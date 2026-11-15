@@ -156,3 +156,32 @@ with tempfile.TemporaryDirectory(prefix="muse-vm-auth-", dir=Path.home()) as hom
         except subprocess.TimeoutExpired:
             proc.kill()
         log.close()
+
+
+# App retry loop: a workspace-unavailable failure must neither mark the account healthy
+# (it would keep being picked) nor failed (no cookie re-import is needed).
+def _check_app_does_not_flip_health():
+    import tempfile as _tf
+    from unittest.mock import patch as _patch
+    os.environ["MUSE2API_HOME"] = _tf.mkdtemp(prefix="m2a-vmauth-app-")
+    import app as appmod
+    for prior in (True, None, False):
+        acc = appmod.store.add_account({"hatch_sess": "fixture"}, label=f"ws-{prior}", cookies_exp={})
+        appmod.store.mark(acc["id"], prior, "before")
+        if prior is None:
+            acc["ok"] = None
+        err = appmod.MuseWorkspaceUnavailable(appmod.MuseEngine.WORKSPACE_UNAVAILABLE_MESSAGE)
+        with _patch.object(appmod.engine, "start"), _patch.object(appmod.engine, "generate", side_effect=err), \
+             _patch.object(appmod, "_renew_and_persist", return_value=None), \
+             _patch.object(appmod, "_bind_account_proxy"), _patch.object(appmod.engine, "close_current_page"):
+            try:
+                appmod._run_generation("p", "video", timeout=30, account_id=acc["id"])
+            except appmod.MuseGenerationError:
+                pass
+        state = appmod.store.get_account(acc["id"])
+        assert state["ok"] is prior, (prior, state["ok"])
+        assert "工作区暂不可用" in state["note"], state["note"]
+    print("PASS: workspace-unavailable keeps account health unchanged in the retry loop")
+
+
+_check_app_does_not_flip_health()

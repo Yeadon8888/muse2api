@@ -53,7 +53,7 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
                     MuseModelRefusalError, RefImageSafetyError, reference_kind)
-from engine import MuseProxyError, MuseSessionUnavailable
+from engine import MuseProxyError, MuseSessionUnavailable, MuseWorkspaceUnavailable
 from store import Store, account_expiry, min_expiry
 from media_janitor import MediaJanitor
 from proxy import normalize_server, request_proxy_context, split_proxy_url
@@ -1212,6 +1212,12 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             except MuseProxyError as exc:
                 last_exc = exc
                 store.touch_keepalive(cur_acc["id"], None, f"代理异常: {str(exc)[:160]}")
+                engine.close_current_page()
+            except MuseWorkspaceUnavailable as exc:
+                # The session is fine but muse.ai has no workspace for it right now: do not
+                # mark it healthy (it would keep winning the pool) nor failed (no re-import needed).
+                last_exc = exc
+                store.touch_keepalive(cur_acc["id"], None, f"工作区暂不可用: {str(exc)[:80]}")
                 engine.close_current_page()
             except MuseGenerationError as exc:
                 last_exc = exc
