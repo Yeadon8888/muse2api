@@ -236,6 +236,10 @@ class MuseSessionUnavailable(MuseGenerationError):
         self.rotated = rotated
 
 
+class MuseWorkspaceUnavailable(MuseGenerationError):
+    """muse.ai 暂时没有为账号分配可用的云端工作区。"""
+
+
 class MuseModelRefusalError(MuseGenerationError):
     """Muse completed the turn with text instead of the requested media."""
 
@@ -530,6 +534,7 @@ class MuseEngine:
             page.send("Network.enable")
             page.send("Page.enable")
             page.send("Runtime.enable")
+            self._install_hatch_token_hook(page)
             page.send("Browser.setDownloadBehavior", {
                 "behavior": "allow", "downloadPath": self._new_download_dir(),
                 "browserContextId": ctx_id,
@@ -714,8 +719,70 @@ class MuseEngine:
             out[name] = {"value": c.get("value", ""), "expires": exp}
         return out
 
-    CRASH_PAGE_MESSAGE = ("muse.ai 页面加载后崩溃为 Something went wrong（工作区令牌 /api/hatch/token "
-                          "被拒绝，常见于 cookie 不完整或会话已在别处失效），请用浏览器扩展重新导入该账号的完整 cookie")
+    CRASH_PAGE_MESSAGE = ("muse.ai 页面加载后崩溃为 Something went wrong，且 /api/hatch/token "
+                          "返回明确的认证失败，请用浏览器扩展重新导入该账号的完整 cookie")
+    WORKSPACE_UNAVAILABLE_MESSAGE = (
+        "muse.ai 暂时无法为该账号分配云端工作区（hatch_vm_auth_no_match），不是 cookie 失效，"
+        "无需重新导入；常见原因：同一账号正在别处（例如浏览器里打开的 muse.ai）占用工作区，"
+        "或 muse.ai 暂时无法分配"
+    )
+
+    # 在任何 muse.ai 脚本运行前捕获 token 接口的分类字段。响应对象只暴露
+    # status/code/error，既不保存也不打印响应中的 token 或其它凭据。
+    _HATCH_TOKEN_HOOK_JS = r"""(() => {
+        if (window.__muse2apiHatchTokenHookInstalled) return;
+        let latest = null;
+        Object.defineProperty(window, '__muse2apiHatchTokenResponse', {
+            configurable: false,
+            enumerable: false,
+            get: () => latest
+        });
+        Object.defineProperty(window, '__muse2apiHatchTokenHookInstalled', {
+            configurable: false,
+            enumerable: false,
+            value: true,
+            writable: false
+        });
+        const isTarget = value => {
+            try {
+                const raw = typeof value === 'string' ? value : value && value.url;
+                return !!raw && new URL(raw, location.href).pathname === '/api/hatch/token';
+            } catch (_) { return false; }
+        };
+        const record = (status, payload) => {
+            const body = payload && typeof payload === 'object' ? payload : {};
+            latest = Object.freeze({
+                status: Number(status) || 0,
+                code: typeof body.code === 'string' ? body.code : '',
+                error: typeof body.error === 'string' ? body.error : ''
+            });
+        };
+        const originalFetch = window.fetch;
+        if (typeof originalFetch === 'function') {
+            window.fetch = function(input) {
+                const promise = originalFetch.apply(this, arguments);
+                if (isTarget(input)) promise.then(response => {
+                    response.clone().json().then(body => record(response.status, body))
+                        .catch(() => record(response.status, null));
+                }).catch(() => {});
+                return promise;
+            };
+        }
+        const originalOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            this.__muse2apiIsHatchToken = isTarget(url);
+            return originalOpen.apply(this, arguments);
+        };
+        const originalSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.send = function() {
+            if (this.__muse2apiIsHatchToken) this.addEventListener('loadend', () => {
+                let body = this.response && typeof this.response === 'object' ? this.response : null;
+                if (!body) try { body = JSON.parse(this.responseText || ''); } catch (_) {}
+                record(this.status, body);
+            }, {once: true});
+            return originalSend.apply(this, arguments);
+        };
+    })();"""
 
     _CRASH_PAGE_JS = """(function(){
         if (document.readyState !== 'complete' || document.querySelector('textarea')) return false;
@@ -729,6 +796,46 @@ class MuseEngine:
             return (page or self.page).js(self._CRASH_PAGE_JS) is True
         except Exception:  # noqa: BLE001
             return False
+
+    def _install_hatch_token_hook(self, page: CDP) -> None:
+        """为后续文档安装只记录 token 失败分类字段的脚本。"""
+        page.send("Page.addScriptToEvaluateOnNewDocument", {"source": self._HATCH_TOKEN_HOOK_JS})
+
+    def _hatch_token_result(self, page: CDP | None = None) -> dict | None:
+        """读取捕获到的安全字段；没有响应或脚本不可用时返回 None。"""
+        try:
+            raw = (page or self.page).js(
+                "JSON.stringify(window.__muse2apiHatchTokenResponse || null)")
+            parsed = json.loads(raw) if isinstance(raw, str) else None
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _crash_page_exception(self, page: CDP | None = None) -> MuseGenerationError:
+        """按 token 接口证据区分认证失效与工作区未分配。"""
+        target = page or self.page
+        try:
+            login_visible = target.js(r"""(function(){
+                var b = document.body ? (document.body.innerText || '') : '';
+                return /log in|sign in|create an account|登录|use another account/i.test(b);
+            })()""") is True
+        except Exception:  # noqa: BLE001
+            login_visible = False
+        if login_visible:
+            return MuseAuthError("会话已被 muse.ai 登出，请用浏览器扩展重新导入 cookie")
+
+        result = self._hatch_token_result(target)
+        code = str((result or {}).get("code") or "")
+        error = str((result or {}).get("error") or "")
+        if code == "hatch_vm_auth_no_match" or "vm auth token unavailable" in error.lower():
+            return MuseWorkspaceUnavailable(self.WORKSPACE_UNAVAILABLE_MESSAGE)
+        if result and result.get("status") == 401 and (code or error):
+            return MuseAuthError(self.CRASH_PAGE_MESSAGE)
+        # 没有接口证据时不能据此判定 cookie 失效。
+        return MuseWorkspaceUnavailable(self.WORKSPACE_UNAVAILABLE_MESSAGE)
+
+    def _raise_crash_page(self, page: CDP | None = None) -> None:
+        raise self._crash_page_exception(page)
 
     def _wait_ws_ready(self, page: CDP, timeout: float = 15.0, fail_on_crash: bool = False) -> bool:
         """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。
@@ -875,8 +982,9 @@ class MuseEngine:
             stable_until = time.time() + 4.0
             while time.time() < stable_until:
                 if self._is_crash_page(page):
+                    exc = self._crash_page_exception(page)
                     self._close_page()
-                    raise MuseAuthError(self.CRASH_PAGE_MESSAGE)
+                    raise exc
                 time.sleep(0.25)
             self.current_acc_id = account_id
             return page
@@ -885,9 +993,10 @@ class MuseEngine:
             body = (page.js("document.body ? document.body.innerText.slice(0,1200) : ''") or "").lower()
         except Exception:
             body = ""
+        crash_exc = self._crash_page_exception(page) if crashed else None
         self._close_page()
         if crashed:
-            raise MuseAuthError(self.CRASH_PAGE_MESSAGE)
+            raise crash_exc
         if proxy and re.search(r"err_(?:proxy|tunnel)|proxy authentication|代理认证失败", body, re.I):
             raise MuseProxyError("账号代理浏览器连接失败，请检查节点或认证；未回退直连")
         if "connecting..." in body:
@@ -1924,7 +2033,7 @@ class MuseEngine:
                     crash_since = crash_since or time.monotonic()
                     if time.monotonic() - crash_since >= 3.0:
                         self._dump_upload_debug()
-                        raise MuseAuthError(self.CRASH_PAGE_MESSAGE)
+                        self._raise_crash_page()
                 else:
                     crash_since = None
                 if not clicked and time.monotonic() >= click_at:
