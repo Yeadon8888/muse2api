@@ -8,6 +8,8 @@
 
 因此，原先“页面可能没有进入工作区流程”的解释被排除；初次 X1 的页面级观察器漏掉了请求。前三次加载都没有取得 token HTTP 200；第四次也是最后一次加载用于 cookie 单份注入实验，但最终结构化结果在 Railway SSH stdout 回收时丢失，无法安全断言是否出现过 200。现有证据仍然既不能证明浏览器 IndexedDB 中存在恢复密钥，也不能证明复制该状态可以恢复 token。
 
+独立于 CVM 假设，Y1 已确定性证明旧 `_apply_cookies` 会给 13 个普通名称各注入 `.muse.ai` domain 与 `muse.ai` host-only 两份 cookie。CTO 据此将其定性为确定缺陷；本分支已改为每个名称只保留一份规范作用域，并在读取回存时过滤历史副本。
+
 ## 安全边界与前置检查
 
 - 只使用标签 238、ID 前缀 `ad3998` 的实验账号；完整账号 ID 未输出或写入报告。
@@ -149,11 +151,29 @@ Y3 已按 Y2 的单份 host-only 方式注入并完成一次 60 秒页面观察�
 
 脚本的控制流在销毁上下文前执行了 `Network.getCookies` 与管理接口回写；事后只读复核确认账号仍为 `enabled=false`、`use_count=0`，账号备注保持“已更新 cookie”，临时脚本已删除。由于最终状态码丢失，不能把备注单独当成本次回写 HTTP 200 的证明。
 
-### Cookie 假设结论
+### `/api/session` Set-Cookie 作用域复核
+
+在不加载页面、不调用 wake 的前提下，生产容器使用账号 238 连续执行了两次无重定向 `GET https://muse.ai/api/session`。每次响应后都在内存中合并响应 cookie 与账号原有 cookie，立即通过管理接口写回完整集合；脚本使用 `python -I`，脱敏结果先写入容器 `/tmp`，单独取回后已删除脚本和结果文件。
+
+| 调用 | session HTTP | Set-Cookie 名称与属性 | cookie 回写 HTTP |
+|---|---:|---|---:|
+| 1 | 200 | 无 Set-Cookie | 200 |
+| 2 | 200 | 无 Set-Cookie | 200 |
+
+两次响应都没有 Set-Cookie，因此没有可列出的 `Domain / Path / Secure / HttpOnly / SameSite` 逐名称属性，也无法从本轮观测建立普通 host-only 名称清单。调用后只读复核为唯一匹配、`enabled=false`、`use_count=0`；没有页面加载、wake 或生成请求。两次调用额度已经用完，没有追加重试。
+
+### Cookie 缺陷结论与修复
 
 **结论：注入重复现象成立，但“重复导致 token 401、单份注入可恢复 token 200”无法确认。**
 
-Y1 证明现有实现会制造两种作用域的同名普通 cookie；Y2 证明单份 host-only 注入能消除重复并正确保留 `__Host-hatch_one_tap`。但任务约定只有 Y3 明确取得 token 200 才修改代码，而 Y3 最终结果不可恢复，也不能再加载页面复验。因此本分支不修改 `engine.py`、`read_cookies` 或 `_report_page_cookies`，PR 继续保持文档实验性质。
+Y1 证明现有实现会制造两种作用域的同名普通 cookie；Y2 证明单份注入能消除重复并正确保留 `__Host-hatch_one_tap`。虽然 Y3 无法证明这就是 token 401 的原因，双份注入本身已经与真实浏览器 cookie jar 不同，属于独立且确定的缺陷。
+
+修复采用以下规范：
+
+- `__Host-` 前缀一律通过 `url=https://muse.ai/` 注入为 host-only，强制 `path=/`、`secure=true`，绝不设置 Domain。
+- 本轮没有观测到普通 cookie 的无 Domain 样本；结合既有跨子域使用方式与 `hatch_vml` 的 domain 轮换场景，其余已知及未知名称默认只保留一份 `.muse.ai` domain cookie。代码中保留普通 host-only 名称集合，后续一旦取得确证可按名称补充。
+- 注入前显式删除同名的 `.muse.ai` domain 与 `muse.ai` host-only 旧副本，再写入唯一规范副本。
+- `read_cookies` 只选规范作用域；`_report_page_cookies` 与 `_sync_cookies` 均消费这个已过滤结果，历史错误作用域不会再覆盖账号池中的新值。
 
 ## 结论与风险
 
@@ -164,11 +184,13 @@ Y1 证明现有实现会制造两种作用域的同名普通 cookie；Y2 证明�
 3. IndexedDB 为空只说明本次上下文在观察窗口内没有建立这些数据库，不能说明用户原浏览器是否持有 CVM 恢复状态。
 4. 浏览器级事件确认 `/api/session` HTTP 200、wake HTTP 200 和 token HTTP 401，说明页面确实进入了工作区连接流程；原 X1 的页面级观察方法不完整。
 5. 现有 cookie 注入会产生 13 个普通名称的 domain/host-only 双份；`__Host-hatch_one_tap` 并未缺失。单份注入能修正 cookie jar 形态，但最后一次 Y3 遥测丢失，无法证明它能修复 token。
+6. 两次独立 `/api/session` 作用域复核均为 HTTP 200 且无 Set-Cookie；修复的普通 cookie 默认 domain 规则因此不是逐名称属性观测结论，后续若发现普通 host-only cookie，必须补入名称清单和回归测试。
 
 如果后续账号能在同一生产出口稳定取得 token 200，应沿用本任务的 A/B/C 对照，并保持最多 4 次加载：X1 A、X2 B、X3 C 的同源引导页与应用页。只有当“空白 B 失败、恢复 A 的 `hatch-cvm-*` 后 C 成功”可重复出现时，才有证据考虑每账号持久化 BrowserContext / 用户数据目录，或让用户浏览器在安全通道中连同 IndexedDB 一起导出；在此之前不建议扩大凭据持久化范围。
 
 ## 离线自测
 
-- `python tests/test_*.py`：39/39 个独立脚本通过，0 失败。
+- `python tests/test_*.py`：40/40 个独立脚本通过，0 失败。
 - `node tests/test_admin_api_error_messages.mjs`：通过。
-- Python 测试使用 `/tmp` 虚拟环境安装现有 `requirements.txt`；需要真实 Chromium 的测试通过临时 `google-chrome` 包装器调用本机 Google Chrome。没有修改项目依赖。
+- 新增真实 Chromium 离线回归：仅访问本地页面，断言每个名称注入后只有一份、普通 cookie 为 `.muse.ai` domain、`__Host-` 为 host-only；模拟 `Domain=.muse.ai` 轮换 `hatch_vml` 后仍为单份新值；再构造历史 host-only 副本，断言读取与回存只选择规范 domain 副本。
+- Python 测试使用 `/tmp` 虚拟环境安装现有 `requirements.txt`；需要真实 Chromium 的测试调用本机 Google Chrome。没有修改项目依赖。

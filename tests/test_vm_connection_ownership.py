@@ -19,8 +19,10 @@ class FakePage:
     def send(self, method, params=None, timeout=None):
         if method == "Network.getCookies":
             return {"result": {"cookies": [
-                {"name": "hatch_sess", "value": "rotated", "expires": 1900000000},
-                {"name": "hatch_gw", "value": "new-gateway", "expires": -1},
+                {"name": "hatch_sess", "value": "rotated", "expires": 1900000000,
+                 "domain": ".muse.ai", "path": "/", "secure": True},
+                {"name": "hatch_gw", "value": "new-gateway", "expires": -1,
+                 "domain": ".muse.ai", "path": "/", "secure": True},
             ]}}
         return {}
 

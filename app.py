@@ -1168,6 +1168,8 @@ def _sync_cookies(acc_id: str) -> dict:
     同步只是锦上添花，出任何问题都只记一条日志。
     """
     try:
+        # engine.read_cookies 已按名称筛掉历史 domain/host-only 非规范副本；这里
+        # 只合并规范作用域的值，避免旧副本重新写回账号池。
         live = engine.read_cookies()
         if not live:
             return {"synced": 0}
