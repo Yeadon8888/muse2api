@@ -35,6 +35,7 @@ import io
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -153,7 +154,11 @@ class AccountPoolManager:
                     acc = self.store.get_account(account_id)
                     if not acc or not acc.get("enabled", True):
                         raise MuseAuthError(f"指定账号 {account_id} 不存在或已禁用")
-                    if account_id not in self.busy_accounts:
+                    cooldown_fn = getattr(self.store, "workspace_cooldown_remaining", None)
+                    cooldown = cooldown_fn(acc) if cooldown_fn else 0
+                    if cooldown and getattr(self.store.cfg, "workspace_circuit_breaker_enabled", True):
+                        raise MuseWorkspaceUnavailable(_workspace_circuit_message(cooldown, all_accounts=False))
+                    if not cooldown and account_id not in self.busy_accounts:
                         self.busy_accounts.add(account_id)
                         return acc
                 else:
@@ -172,6 +177,12 @@ class AccountPoolManager:
                 live = [a for a in self.store.accounts if a.get("enabled", True) and a.get("cookies")]
                 if not live:
                     raise MuseAuthError("没有可用账号，请先在管理页面导入 cookie")
+                cooling_fn = getattr(self.store, "all_schedulable_accounts_cooling", None)
+                all_cooling, remaining_cooldown = cooling_fn() if cooling_fn else (False, 0)
+                if (all_cooling
+                        and getattr(self.store.cfg, "workspace_circuit_breaker_enabled", True)):
+                    raise MuseWorkspaceUnavailable(
+                        _workspace_circuit_message(remaining_cooldown, all_accounts=True))
 
                 self.cond.wait(timeout=min(remaining, 0.5))
 
@@ -352,6 +363,57 @@ def _persist_session_cookies(acc_id: str, cookies: dict, cookies_exp: dict | Non
 engine.cookie_sink = _persist_session_cookies
 
 
+def _workspace_circuit_message(remaining_seconds: int, all_accounts: bool = True) -> str:
+    minutes = max(1, math.ceil(max(0, remaining_seconds) / 60))
+    subject = "muse.ai 当前没有为任何账号分配工作区（上游故障）" if all_accounts else "指定账号的 muse.ai 工作区暂不可用"
+    return f"{subject}，已暂停请求，约 {minutes} 分钟后自动重试；无需重新导入 cookie"
+
+
+def _request_account_or_http_error() -> dict:
+    acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
+    if acc:
+        return acc
+    all_cooling, remaining = store.all_schedulable_accounts_cooling()
+    if all_cooling and getattr(CFG, "workspace_circuit_breaker_enabled", True):
+        raise HTTPException(502, _workspace_circuit_message(remaining))
+    raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+
+
+def _raise_if_workspace_circuit_open() -> None:
+    if not getattr(CFG, "workspace_circuit_breaker_enabled", True):
+        return
+    all_cooling, remaining = store.all_schedulable_accounts_cooling()
+    if all_cooling:
+        raise MuseWorkspaceUnavailable(_workspace_circuit_message(remaining))
+
+
+def _rediscover_workspace(acc: dict, deadline: float | None = None) -> bool:
+    """no-match 后只做一次无 wake 的 session 发现；任何未确认结果都交给冷却/换号。"""
+    delay = getattr(CFG, "workspace_rediscovery_delay_seconds", 15.0)
+    if delay:
+        if deadline is not None and time.monotonic() + delay >= deadline:
+            return False
+        time.sleep(delay)
+    latest = store.get_account(acc["id"]) or acc
+    try:
+        res = engine.renew_session_http(
+            latest["cookies"], latest.get("cookies_exp"), wake_vm=False,
+            **({"proxy": _account_proxy(latest)} if _account_proxy(latest) else {}),
+        )
+        _persist_session_cookies(acc["id"], res.get("cookies") or {}, res.get("cookies_exp"))
+        if res.get("status") != "assigned":
+            return False
+        engine._last_http_renew[acc["id"]] = time.time()
+        store.touch_keepalive(acc["id"], True, f"会话正常 (VM: {res.get('vm_state') or 'RUNNING'})")
+        return True
+    except MuseSessionUnavailable as exc:
+        _persist_session_cookies(acc["id"], exc.cookies, exc.cookies_exp)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("账号 %s 工作区单次重新发现失败: %s", acc["id"], exc)
+        return False
+
+
 def _renew_and_persist(acc_id: str, wake_vm: bool = False, force: bool = False) -> dict | None:
     """调用 /api/session 续签账号 cookie 并写回 store，返回最新账号 dict。
     近期（10分钟内）已续签且状态正常的账号直接复用，避免每次请求阻塞 2~3 秒 HTTP 往返。"""
@@ -434,44 +496,63 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     leased_id = cur_id
 
                 yielded = False
-                try:
-                    if cur_id:
-                        _bind_account_proxy(store.get_account(cur_id) or {})
-                        refreshed = _renew_and_persist(cur_id, wake_vm=False, force=(attempt > 0))
-                        if refreshed:
-                            cur_cookies = refreshed["cookies"]
-                            cur_exp = refreshed.get("cookies_exp")
-                    with GEN_LOCK:
-                        if stop_event.is_set():
-                            return
-                        engine.start()
-                        for chunk in engine.chat_stream(
-                            cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event
-                        ):
-                            yielded = True
-                            q.put(("data", chunk))
+                rediscovered = False
+                while True:
+                    try:
+                        if cur_id:
+                            _bind_account_proxy(store.get_account(cur_id) or {})
+                            refreshed = _renew_and_persist(cur_id, wake_vm=False, force=(attempt > 0))
+                            if refreshed:
+                                cur_cookies = refreshed["cookies"]
+                                cur_exp = refreshed.get("cookies_exp")
+                        with GEN_LOCK:
                             if stop_event.is_set():
                                 return
-                    if cur_id:
-                        store.mark(cur_id, True, "")
-                        _sync_cookies(cur_id)
-                    return
-                except MuseAuthError as exc:
-                    last_exc = exc
-                    if cur_id:
-                        store.mark(cur_id, False, str(exc))
-                    engine.close_current_page()
-                    if yielded:
+                            engine.start()
+                            for chunk in engine.chat_stream(
+                                cur_cookies, prompt, cur_exp, timeout,
+                                account_id=cur_id, stop_event=stop_event
+                            ):
+                                yielded = True
+                                q.put(("data", chunk))
+                                if stop_event.is_set():
+                                    return
+                        if cur_id:
+                            store.mark(cur_id, True, "")
+                            _sync_cookies(cur_id)
+                        return
+                    except MuseAuthError as exc:
+                        last_exc = exc
+                        if cur_id:
+                            store.mark(cur_id, False, str(exc))
+                        engine.close_current_page()
                         break
-                except Exception as exc:
-                    last_exc = exc
-                    try:
-                        engine.reset_thread()
-                    except Exception:
-                        pass
-                    if yielded:
+                    except MuseWorkspaceUnavailable as exc:
+                        last_exc = exc
+                        engine.close_current_page()
+                        account = store.get_account(cur_id) if cur_id else None
+                        if not yielded and account and not rediscovered:
+                            rediscovered = True
+                            if _rediscover_workspace(account):
+                                latest = store.get_account(cur_id) or account
+                                cur_cookies = latest["cookies"]
+                                cur_exp = latest.get("cookies_exp")
+                                continue
+                        if cur_id:
+                            store.set_workspace_cooldown(
+                                cur_id, getattr(CFG, "workspace_cooldown_seconds", 300),
+                                f"工作区暂不可用（上游故障）: {str(exc)[:80]}",
+                            )
                         break
+                    except Exception as exc:
+                        last_exc = exc
+                        try:
+                            engine.reset_thread()
+                        except Exception:
+                            pass
+                        break
+                if yielded:
+                    break
             if last_exc is not None:
                 q.put(("error", last_exc))
         finally:
@@ -1124,6 +1205,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     reference_images: list[str] | None = None,
                     on_acquired=None) -> tuple[dict, str | None]:
     # Browser ownership covers account selection, retry and cleanup, not just generate().
+    _raise_if_workspace_circuit_open()
     deadline = time.monotonic() + max(1, timeout)
     if not GEN_LOCK.acquire(timeout=max(1, timeout)):
         raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
@@ -1183,52 +1265,66 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     break
                 cur_acc = alt
                 log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
-            try:
-                _bind_account_proxy(cur_acc)
-                refreshed = _renew_and_persist(cur_acc["id"], wake_vm=False, force=(attempt > 0))
-                if refreshed:
-                    cur_acc = refreshed
-                engine.start()
-                remaining = int(deadline - time.monotonic()) if deadline is not None else timeout
-                if remaining <= 0:
-                    raise MuseGenerationError("任务总等待时限已到，停止重试")
-                refs = list(reference_images or [])
-                engine_kwargs = {}
-                if len(refs) == 1 and not reference_image:
-                    reference_image = refs[0]
-                elif len(refs) > 1:
-                    engine_kwargs["reference_images"] = refs
-                res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
-                                      timeout=remaining, expires=cur_acc.get("cookies_exp"),
-                                      account_id=cur_acc["id"], on_progress=on_progress,
-                                      reference_image=reference_image, **engine_kwargs)
-                store.mark(cur_acc["id"], True, "")
-                _sync_cookies(cur_acc["id"])
-                return res, cur_acc["id"]
-            except MuseAuthError as exc:
-                last_exc = exc
-                store.mark(cur_acc["id"], False, str(exc))
-                engine.close_current_page()
-            except MuseProxyError as exc:
-                last_exc = exc
-                store.touch_keepalive(cur_acc["id"], None, f"代理异常: {str(exc)[:160]}")
-                engine.close_current_page()
-            except MuseWorkspaceUnavailable as exc:
-                # The session is fine but muse.ai has no workspace for it right now: do not
-                # mark it healthy (it would keep winning the pool) nor failed (no re-import needed).
-                last_exc = exc
-                store.touch_keepalive(cur_acc["id"], None, f"工作区暂不可用: {str(exc)[:80]}")
-                engine.close_current_page()
-            except MuseGenerationError as exc:
-                last_exc = exc
-                store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
+            rediscovered = False
+            while True:
                 try:
-                    engine.reset_thread()
-                except Exception:
-                    pass
-            except Exception as exc:  # noqa: BLE001
-                engine.close_current_page()
-                last_exc = MuseGenerationError(f"生成失败: {exc}")
+                    _bind_account_proxy(cur_acc)
+                    refreshed = _renew_and_persist(cur_acc["id"], wake_vm=False, force=(attempt > 0))
+                    if refreshed:
+                        cur_acc = refreshed
+                    engine.start()
+                    remaining = int(deadline - time.monotonic()) if deadline is not None else timeout
+                    if remaining <= 0:
+                        raise MuseGenerationError("任务总等待时限已到，停止重试")
+                    refs = list(reference_images or [])
+                    engine_kwargs = {}
+                    if len(refs) == 1 and not reference_image:
+                        reference_image = refs[0]
+                    elif len(refs) > 1:
+                        engine_kwargs["reference_images"] = refs
+                    res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
+                                          timeout=remaining, expires=cur_acc.get("cookies_exp"),
+                                          account_id=cur_acc["id"], on_progress=on_progress,
+                                          reference_image=reference_image, **engine_kwargs)
+                    store.mark(cur_acc["id"], True, "")
+                    _sync_cookies(cur_acc["id"])
+                    return res, cur_acc["id"]
+                except MuseAuthError as exc:
+                    last_exc = exc
+                    store.mark(cur_acc["id"], False, str(exc))
+                    engine.close_current_page()
+                    break
+                except MuseProxyError as exc:
+                    last_exc = exc
+                    store.touch_keepalive(cur_acc["id"], None, f"代理异常: {str(exc)[:160]}")
+                    engine.close_current_page()
+                    break
+                except MuseWorkspaceUnavailable as exc:
+                    # 关闭页面会先回存轮换 cookie；每账号只允许一次无 wake 的重新发现。
+                    last_exc = exc
+                    engine.close_current_page()
+                    if not rediscovered:
+                        rediscovered = True
+                        if _rediscover_workspace(cur_acc, deadline=deadline):
+                            cur_acc = store.get_account(cur_acc["id"]) or cur_acc
+                            continue
+                    store.set_workspace_cooldown(
+                        cur_acc["id"], getattr(CFG, "workspace_cooldown_seconds", 300),
+                        f"工作区暂不可用（上游故障）: {str(exc)[:80]}",
+                    )
+                    break
+                except MuseGenerationError as exc:
+                    last_exc = exc
+                    store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
+                    try:
+                        engine.reset_thread()
+                    except Exception:
+                        pass
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    engine.close_current_page()
+                    last_exc = MuseGenerationError(f"生成失败: {exc}")
+                    break
         raise last_exc
     finally:
         if cur_acc:
@@ -1627,9 +1723,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
-    if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+    acc = _request_account_or_http_error()
 
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
@@ -1789,9 +1883,7 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
-    if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+    acc = _request_account_or_http_error()
 
     rid = "resp_" + uuid.uuid4().hex[:24]
     mid = "msg_" + uuid.uuid4().hex[:24]

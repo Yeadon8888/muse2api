@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import uuid
+import math
 
 from proxy import public_proxy
 
@@ -143,8 +144,41 @@ class Store:
                 a.get("cookies", {}).get(n) for n in ESSENTIAL_COOKIES)
             # 有效期是 hatch_vml 的实测 expires，还是按「2 天寿命」推算的
             item["expires_estimated"] = not _is_pos(ce.get("hatch_vml"))
+            item["workspace_cooldown_remaining_seconds"] = self.workspace_cooldown_remaining(a)
             out.append(item)
         return out
+
+    @staticmethod
+    def workspace_cooldown_remaining(account: dict, now: float | None = None) -> int:
+        """返回账号工作区冷却剩余秒数；到期后无需改状态即可自动恢复调度。"""
+        try:
+            until = float(account.get("workspace_cooldown_until") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, math.ceil(until - (time.time() if now is None else now)))
+
+    def set_workspace_cooldown(self, aid: str, seconds: int, note: str = "") -> dict | None:
+        """记录临时上游故障；不改变账号 ok，避免误导用户重新导入 cookie。"""
+        with _LOCK:
+            now = time.time()
+            for a in self.accounts:
+                if a["id"] == aid:
+                    a["workspace_cooldown_until"] = now + max(0, seconds)
+                    a["workspace_unavailable_at"] = int(now)
+                    if note:
+                        a["note"] = note[:300]
+                    a["checked_at"] = int(now)
+                    _write(self.cfg.accounts_file, self.accounts)
+                    return a
+        return None
+
+    def all_schedulable_accounts_cooling(self) -> tuple[bool, int]:
+        """返回是否所有可调度账号都在冷却，以及最早恢复所需秒数。"""
+        live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
+        if not live:
+            return False, 0
+        remaining = [self.workspace_cooldown_remaining(a) for a in live]
+        return all(value > 0 for value in remaining), min(remaining)
 
     def delete_account(self, aid: str) -> bool:
         with _LOCK:
@@ -160,7 +194,9 @@ class Store:
         """选择可用账号：优先复用当前已预热的健康账号（减少切号重连耗时），每满 15 次或遇错自动轮转。
         exclude_ids: 需要排除的账号 ID 集合（例如正在被其他并发线程占用的账号）。"""
         with _LOCK:
-            live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
+            live = [a for a in self.accounts
+                    if a.get("enabled", True) and a.get("cookies")
+                    and self.workspace_cooldown_remaining(a) == 0]
             if not live:
                 return None
             any_healthy = any(a.get("ok") is not False for a in live)
