@@ -470,6 +470,9 @@ class MuseEngine:
         p = self.page
         ctx_id = self.current_context_id
         if p:
+            # muse.ai 会在失败页面里照样轮换 httpOnly cookie；必须在销毁隔离
+            # 上下文前读回，否则下次会继续使用已经作废的旧值。
+            self._report_page_cookies(self.current_acc_id, p)
             try:
                 p.close()
             except Exception:
@@ -552,7 +555,7 @@ class MuseEngine:
 
     @staticmethod
     def renew_session_http(cookies: dict, expires: dict | None = None,
-                           wake_vm: bool = True, proxy: dict | None = None) -> dict:
+                           wake_vm: bool = False, proxy: dict | None = None) -> dict:
         """直接调用 muse.ai/api/session 续签 hatch_vml (+48h) / hatch_sess (+30d) / hatch_gw (+1y)，
         并按需调用 /api/hatch/vm/wake 唤醒云端工作区 VM。"""
         import requests
@@ -693,22 +696,29 @@ class MuseEngine:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def read_cookies(self) -> dict[str, dict]:
+    def read_cookies(self, page: CDP | None = None) -> dict[str, dict]:
         """从当前页面读回 cookie（**包含 httpOnly**，这是网页 JS 做不到的）。
 
         返回 {name: {"value":..., "expires": unix秒 或 -1}}。
         用途：muse.ai 在访问时会续期部分 cookie，生成完读回来写进账号池，
         账号就不容易过期。
         """
-        if not self.page:
+        target = page or self.page
+        if not target:
             return {}
         try:
-            msg = self.page.send("Network.getCookies",
-                                 {"urls": [self.cfg.site_url]}, timeout=20)
+            msg = target.send("Network.getCookies",
+                              {"urls": [self.cfg.site_url]}, timeout=20)
         except Exception:  # noqa: BLE001
             return {}
+        result = msg.get("result", {}) if isinstance(msg, dict) else {}
+        raw_cookies = result.get("cookies") if isinstance(result, dict) else None
+        if not isinstance(raw_cookies, list):
+            return {}
         out: dict[str, dict] = {}
-        for c in (msg.get("result", {}).get("cookies") or []):
+        for c in raw_cookies:
+            if not isinstance(c, dict):
+                continue
             name = c.get("name")
             if not name:
                 continue
@@ -925,6 +935,17 @@ class MuseEngine:
         except Exception as e:  # noqa: BLE001
             log.warning("保存轮换后的 cookie 失败 %s: %s", account_id, e)
 
+    def _report_page_cookies(self, account_id: str | None, page: CDP) -> None:
+        """在页面成功或失败关闭前回存浏览器收到的最新 cookie。"""
+        if not account_id:
+            return
+        live = self.read_cookies(page)
+        values = {name: item.get("value") for name, item in live.items()
+                  if item.get("value")}
+        expires = {name: item.get("expires") for name, item in live.items()
+                   if item.get("expires", -1) > 0}
+        self._report_rotated_cookies(account_id, values, expires)
+
     def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
         resolver = getattr(self, "proxy_resolver", None)
         local = self._ensure_local()
@@ -948,7 +969,9 @@ class MuseEngine:
         now_ts = time.time()
         if not account_id or (now_ts - last_map.get(account_id, 0) > 600):
             try:
-                renewed = self.renew_session_http(cookies, expires, wake_vm=True,
+                # 页面前端会用同一连接流程的 connect_attempt_id 自行唤醒 VM；
+                # 这里若另发随机 ID 的 wake，可能抢占页面随后申请 token 的匹配关系。
+                renewed = self.renew_session_http(cookies, expires, wake_vm=False,
                                                   **({"proxy": proxy} if proxy else {}))
                 if renewed.get("cookies"):
                     cookies = renewed["cookies"]
@@ -973,6 +996,7 @@ class MuseEngine:
 
         page = self._open_page(proxy=proxy) if proxy else self._open_page()
         self.page = page  # Cleanup must also own pages that never become ready.
+        self.current_acc_id = account_id  # 失败关闭前也要按账号回存页面轮换的 cookie。
         self._ensure_local().proxy_config = proxy
         self._apply_cookies(page, cookies, expires)
         page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
@@ -986,7 +1010,6 @@ class MuseEngine:
                     self._close_page()
                     raise exc
                 time.sleep(0.25)
-            self.current_acc_id = account_id
             return page
         crashed = self._is_crash_page(page)
         try:

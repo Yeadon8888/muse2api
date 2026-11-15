@@ -26,7 +26,7 @@ for verified, want_state, want_ok in [
     (response({}, status=503), 'SUSPENDED', False),
 ]:
     with patch('requests.get', side_effect=[initial, verified]), patch('requests.post', return_value=wake_ack):
-        result = engine.MuseEngine.renew_session_http({'hatch_sess': 'fixture'})
+        result = engine.MuseEngine.renew_session_http({'hatch_sess': 'fixture'}, wake_vm=True)
     assert result['wake_requested'] is True
     assert result['wake_ok'] is want_ok
     assert result['vm_state'] == want_state

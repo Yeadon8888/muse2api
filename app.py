@@ -352,7 +352,7 @@ def _persist_session_cookies(acc_id: str, cookies: dict, cookies_exp: dict | Non
 engine.cookie_sink = _persist_session_cookies
 
 
-def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -> dict | None:
+def _renew_and_persist(acc_id: str, wake_vm: bool = False, force: bool = False) -> dict | None:
     """调用 /api/session 续签账号 cookie 并写回 store，返回最新账号 dict。
     近期（10分钟内）已续签且状态正常的账号直接复用，避免每次请求阻塞 2~3 秒 HTTP 往返。"""
     acc = store.get_account(acc_id)
@@ -437,7 +437,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                 try:
                     if cur_id:
                         _bind_account_proxy(store.get_account(cur_id) or {})
-                        refreshed = _renew_and_persist(cur_id, wake_vm=True, force=(attempt > 0))
+                        refreshed = _renew_and_persist(cur_id, wake_vm=False, force=(attempt > 0))
                         if refreshed:
                             cur_cookies = refreshed["cookies"]
                             cur_exp = refreshed.get("cookies_exp")
@@ -1185,7 +1185,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
             try:
                 _bind_account_proxy(cur_acc)
-                refreshed = _renew_and_persist(cur_acc["id"], wake_vm=True, force=(attempt > 0))
+                refreshed = _renew_and_persist(cur_acc["id"], wake_vm=False, force=(attempt > 0))
                 if refreshed:
                     cur_acc = refreshed
                 engine.start()
@@ -2403,7 +2403,7 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
         with _account_operation(aid) as acc:
             if not acc.get("cookies"):
                 return {"ok": False, "id": aid, "label": acc.get("label", aid), "error": "账号无有效 cookie"}
-            res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=True,
+            res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=False,
                                             **({"proxy": _account_proxy(acc)} if _account_proxy(acc) else {}))
             store.update_account(
                 aid,
@@ -2513,7 +2513,7 @@ def _warmup_browser_sync():
         acc = ACCOUNT_POOL.acquire(rotate=False, timeout=0.1, record_use=False)
         log.info("【浏览器预热】正在后台预热账号 %s (%s) 的热备标签页...", acc.get("label"), acc["id"])
         _bind_account_proxy(acc)
-        refreshed = _renew_and_persist(acc["id"], wake_vm=True, force=False) or acc
+        refreshed = _renew_and_persist(acc["id"], wake_vm=False, force=False) or acc
         engine.start()
         engine.ensure_page(refreshed["cookies"], refreshed.get("cookies_exp"), account_id=acc["id"])
         log.info("【浏览器预热】账号 %s (%s) 热备标签页与 WebSocket 已就绪", acc.get("label"), acc["id"])
