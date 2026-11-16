@@ -112,6 +112,12 @@ class Config:
     workspace_circuit_breaker_enabled: bool = field(
         default_factory=lambda: _env("MUSE2API_WORKSPACE_CIRCUIT_BREAKER_ENABLED", "1").strip() != "0")
 
+    # 模型明确报告图片/视频额度耗尽时，按任务种类暂停该账号；不影响账号健康状态。
+    video_quota_cooldown_hours: float = field(
+        default_factory=lambda: max(0.0, float(_env("MUSE2API_VIDEO_QUOTA_COOLDOWN_HOURS", "24"))))
+    image_quota_cooldown_hours: float = field(
+        default_factory=lambda: max(0.0, float(_env("MUSE2API_IMAGE_QUOTA_COOLDOWN_HOURS", "24"))))
+
     # 参考图输入默认只允许调用方直接提供数据和公网 URL。
     # 仅可信单用户部署可显式设为 1 恢复服务器本地文件或私网抓取。
     ref_image_local_files: bool = field(

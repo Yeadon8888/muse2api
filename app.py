@@ -53,7 +53,8 @@ from config import CFG
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
-                    MuseModelRefusalError, RefImageSafetyError, reference_kind)
+                    MuseModelRefusalError, MuseQuotaLimitError, RefImageSafetyError,
+                    reference_kind)
 from engine import MuseProxyError, MuseSessionUnavailable, MuseWorkspaceUnavailable
 from store import Store, account_expiry, min_expiry
 from media_janitor import MediaJanitor
@@ -142,7 +143,8 @@ class AccountPoolManager:
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
-                timeout: float = 60.0, record_use: bool = True) -> dict:
+                timeout: float = 60.0, record_use: bool = True,
+                task_kind: str | None = None) -> dict:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
@@ -158,18 +160,27 @@ class AccountPoolManager:
                     cooldown = cooldown_fn(acc) if cooldown_fn else 0
                     if cooldown and getattr(self.store.cfg, "workspace_circuit_breaker_enabled", True):
                         raise MuseWorkspaceUnavailable(_workspace_circuit_message(cooldown, all_accounts=False))
-                    if not cooldown and account_id not in self.busy_accounts:
+                    quota_fn = getattr(self.store, "quota_cooldown_remaining", None)
+                    quota_cooldown = quota_fn(acc, task_kind) if quota_fn and task_kind else 0
+                    if quota_cooldown:
+                        raise MuseQuotaLimitError(
+                            _quota_circuit_message(quota_cooldown, task_kind, all_accounts=False),
+                            kind=task_kind)
+                    if not cooldown and not quota_cooldown and account_id not in self.busy_accounts:
                         self.busy_accounts.add(account_id)
                         return acc
                 else:
                     pref = preferred_id if preferred_id not in self.busy_accounts else None
-                    acc = self.store.pick_account(
+                    pick_kwargs = dict(
                         preferred_id=pref,
                         rotate=rotate,
                         force_rotate=force_rotate,
                         exclude_ids=self.busy_accounts,
                         record_use=record_use,
                     )
+                    if task_kind:
+                        pick_kwargs["task_kind"] = task_kind
+                    acc = self.store.pick_account(**pick_kwargs)
                     if acc:
                         self.busy_accounts.add(acc["id"])
                         return acc
@@ -183,6 +194,12 @@ class AccountPoolManager:
                         and getattr(self.store.cfg, "workspace_circuit_breaker_enabled", True)):
                     raise MuseWorkspaceUnavailable(
                         _workspace_circuit_message(remaining_cooldown, all_accounts=True))
+                quota_fn = getattr(self.store, "all_schedulable_accounts_quota_cooling", None)
+                all_quota, quota_remaining = (
+                    quota_fn(task_kind) if quota_fn and task_kind else (False, 0))
+                if all_quota:
+                    raise MuseQuotaLimitError(
+                        _quota_circuit_message(quota_remaining, task_kind), kind=task_kind)
 
                 self.cond.wait(timeout=min(remaining, 0.5))
 
@@ -369,6 +386,16 @@ def _workspace_circuit_message(remaining_seconds: int, all_accounts: bool = True
     return f"{subject}，已暂停请求，约 {minutes} 分钟后自动重试；无需重新导入 cookie"
 
 
+def _quota_circuit_message(remaining_seconds: int, kind: str,
+                           all_accounts: bool = True) -> str:
+    hours = max(1, math.ceil(max(0, remaining_seconds) / 3600))
+    label = {"video": "视频", "image": "图片"}.get(kind, "通用")
+    if all_accounts:
+        detail = "（免费账号约每 24 小时 1 条）" if kind == "video" else ""
+        return f"所有账号的 muse.ai {label}额度已用完{detail}，最早约 {hours} 小时后恢复"
+    return f"指定账号的 muse.ai {label}额度已用完，约 {hours} 小时后恢复"
+
+
 def _request_account_or_http_error() -> dict:
     acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
     if acc:
@@ -385,6 +412,12 @@ def _raise_if_workspace_circuit_open() -> None:
     all_cooling, remaining = store.all_schedulable_accounts_cooling()
     if all_cooling:
         raise MuseWorkspaceUnavailable(_workspace_circuit_message(remaining))
+
+
+def _raise_if_quota_circuit_open(kind: str) -> None:
+    all_cooling, remaining = store.all_schedulable_accounts_quota_cooling(kind)
+    if all_cooling:
+        raise MuseQuotaLimitError(_quota_circuit_message(remaining, kind), kind=kind)
 
 
 def _rediscover_workspace(acc: dict, deadline: float | None = None) -> bool:
@@ -1208,6 +1241,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     on_acquired=None) -> tuple[dict, str | None]:
     # Browser ownership covers account selection, retry and cleanup, not just generate().
     _raise_if_workspace_circuit_open()
+    _raise_if_quota_circuit_open(kind)
     deadline = time.monotonic() + max(1, timeout)
     if not GEN_LOCK.acquire(timeout=max(1, timeout)):
         raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
@@ -1243,7 +1277,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 break
     acc = ACCOUNT_POOL.acquire(account_id=account_id,
                                preferred_id=preferred_id,
-                               timeout=max(1, remaining_wait))
+                               timeout=max(1, remaining_wait), task_kind=kind)
     cur_acc = acc
     last_exc = None
     try:
@@ -1251,7 +1285,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             if deadline is not None and time.monotonic() >= deadline:
                 raise MuseGenerationError("任务总等待时限已到，停止重试")
             if attempt > 0:
-                if isinstance(last_exc, MuseModelRefusalError):
+                if (isinstance(last_exc, MuseModelRefusalError)
+                        and not isinstance(last_exc, MuseQuotaLimitError)):
                     break
                 old_id = cur_acc["id"] if cur_acc else None
                 if old_id:
@@ -1260,7 +1295,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 rem = int(deadline - time.monotonic()) if deadline is not None else timeout
                 if rem <= 0:
                     break
-                alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=rem)
+                alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=rem,
+                                           task_kind=kind)
                 if not alt or (old_id and alt["id"] == old_id):
                     if alt:
                         cur_acc = alt
@@ -1314,6 +1350,20 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                         cur_acc["id"], getattr(CFG, "workspace_cooldown_seconds", 300),
                         f"工作区暂不可用（上游故障）: {str(exc)[:80]}",
                     )
+                    break
+                except MuseQuotaLimitError as exc:
+                    last_exc = exc
+                    quota_kind = exc.kind if exc.kind in ("video", "image", "any") else kind
+                    default_kind = kind if quota_kind == "any" else quota_kind
+                    hours = (getattr(CFG, "video_quota_cooldown_hours", 24)
+                             if default_kind == "video"
+                             else getattr(CFG, "image_quota_cooldown_hours", 24))
+                    store.set_quota_cooldown(
+                        cur_acc["id"], quota_kind, seconds=hours * 3600,
+                        reset_at=exc.reset_at,
+                        note=f"{quota_kind} 额度冷却: {str(exc)[:120]}",
+                    )
+                    engine.close_current_page()
                     break
                 except MuseGenerationError as exc:
                     last_exc = exc
@@ -2143,6 +2193,19 @@ def del_account(aid: str, _=Depends(auth)):
     with ACCOUNT_POOL.cond:
         _PROXY_TEST_RECEIPTS.pop(aid, None)
     return {"deleted": True, "id": aid}
+
+
+@app.delete("/admin/accounts/{aid}/quota-cooldown")
+def clear_account_quota_cooldown(aid: str, kind: str | None = None, _=Depends(auth)):
+    if kind is not None and kind not in ("video", "image", "any"):
+        raise HTTPException(400, "额度种类必须是 video、image 或 any")
+    account = store.clear_quota_cooldown(aid, kind)
+    if not account:
+        raise HTTPException(404, "账号不存在")
+    with ACCOUNT_POOL.cond:
+        ACCOUNT_POOL.cond.notify_all()
+    return {"cleared": True, "id": aid, "kind": kind or "all",
+            "account": store.public_account(account)}
 
 
 @app.post("/admin/accounts/{aid}/test")

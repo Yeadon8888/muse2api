@@ -266,6 +266,65 @@ class MuseModelRefusalError(MuseGenerationError):
     """Muse completed the turn with text instead of the requested media."""
 
 
+class MuseQuotaLimitError(MuseModelRefusalError):
+    """Muse 明确回复账号额度已到上限；与普通模型拒绝分开处理。"""
+
+    def __init__(self, message: str, kind: str = "any",
+                 reset_at: float | None = None):
+        super().__init__(message)
+        self.kind = kind if kind in ("video", "image", "any") else "any"
+        self.reset_at = reset_at
+
+
+# 额度文案来自模型自然语言，保留成独立列表便于按生产样本增补。
+QUOTA_LIMIT_PATTERNS = (
+    re.compile(r"24\s*(?:个)?\s*小时.{0,20}(?:视频)?.{0,8}上限", re.I),
+    re.compile(r"视频.{0,20}(?:额度|生成次数)?.{0,8}(?:上限|用完|已用完)", re.I),
+    re.compile(r"\bvideo.{0,20}\blimit\b", re.I),
+    re.compile(r"\b(?:reached|hit)\s+(?:your\s+)?usage\s+limit\b", re.I),
+    re.compile(r"\busage\s+limit\b", re.I),
+    re.compile(r"(?:额度|配额).{0,8}(?:用完|已用完|耗尽|不足)", re.I),
+    re.compile(r"(?:每日|每天|24\s*(?:个)?\s*小时).{0,20}上限", re.I),
+    re.compile(r"\b(?:out of credits|quota (?:exhausted|limit))\b", re.I),
+)
+
+_QUOTA_RESET_PATTERNS = (
+    re.compile(
+        r"(?:reset(?:s|ting)?|try again|available again|恢复|重置|再试)"
+        r".{0,24}?(\d+(?:\.\d+)?)\s*(hours?|hrs?|小时|minutes?|mins?|分钟)", re.I),
+    re.compile(
+        r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|小时|minutes?|mins?|分钟)"
+        r".{0,16}?(?:后|reset|恢复|重置|再试)", re.I),
+)
+
+
+def detect_quota_limit(text: str, expected_kind: str = "any") -> MuseQuotaLimitError | None:
+    """识别模型额度回复，并尽力提取相对重置时间。"""
+    clean = " ".join(str(text or "").split())
+    if not clean or not any(pattern.search(clean) for pattern in QUOTA_LIMIT_PATTERNS):
+        return None
+    if re.search(r"(?:视频|\bvideo\b)", clean, re.I):
+        kind = "video"
+    elif re.search(r"(?:图片|图像|生图|\bimage\b|\bpicture\b)", clean, re.I):
+        kind = "image"
+    else:
+        kind = expected_kind if expected_kind in ("video", "image") else "any"
+    reset_at = None
+    for pattern in _QUOTA_RESET_PATTERNS:
+        match = pattern.search(clean)
+        if not match:
+            continue
+        amount = float(match.group(1))
+        unit = match.group(2).lower()
+        seconds = amount * (3600 if unit.startswith(("h", "小")) else 60)
+        reset_at = time.time() + seconds
+        break
+    return MuseQuotaLimitError(
+        f"muse.ai {kind if kind != 'any' else '通用'}额度已用完: {clean[:240]}",
+        kind=kind, reset_at=reset_at,
+    )
+
+
 class RefImageSafetyError(MuseGenerationError):
     """A reference image source is forbidden by the configured input policy."""
 
@@ -1559,7 +1618,10 @@ class MuseEngine:
                 elif unsent and elapsed > 60.0:
                     raise MuseGenerationError("提示词没有发出去（%s 仍在输入框里），终止等待并换号重试" % unsent)
 
-            if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail, re.I):
+            quota_error = detect_quota_limit(tail, expect)
+            if quota_error:
+                raise quota_error
+            if re.search(r"积分不足|token limit", tail, re.I):
                 raise MuseGenerationError("账号额度不足")
             # A Stop button is also shown for messages never acknowledged by the gateway.
             if elapsed > 30.0 and cur_cnt == base_agent_cnt and re.search(
@@ -1576,6 +1638,9 @@ class MuseEngine:
                 else:
                     refusal_last, refusal_stable = refusal, 0
                 if refusal_stable >= 4 and elapsed > 8.0:
+                    quota_error = detect_quota_limit(refusal, expect)
+                    if quota_error:
+                        raise quota_error
                     raise MuseModelRefusalError(f"模型未生成媒体，仅返回文本: {refusal}")
             else:
                 refusal_last, refusal_stable = "", 0
@@ -1590,6 +1655,9 @@ class MuseEngine:
                         last_txt, txt_stable = cur_txt, 0
                     if txt_stable >= 15 and elapsed > 8.0:
                         clean = self._clean_model_text(cur_txt)
+                        quota_error = detect_quota_limit(clean, expect)
+                        if quota_error:
+                            raise quota_error
                         raise MuseModelRefusalError(
                             f"模型未生成媒体，仅返回文本: {clean}")
                 else:

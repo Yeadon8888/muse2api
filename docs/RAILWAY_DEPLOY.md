@@ -58,6 +58,8 @@ Railway 数据卷挂载到 `/app/data`。镜像把 `MUSE2API_HOME` 设为 `/app`
 | `MUSE2API_WORKSPACE_COOLDOWN_SECONDS` | `300` | 账号遇到工作区未分配后的冷却秒数；冷却期间不参与业务调度，到期自动恢复，不改变账号 `ok` 状态 |
 | `MUSE2API_WORKSPACE_REDISCOVERY_DELAY_SECONDS` | `15` | 首次遇到工作区 no-match 后，关闭页面并再次查询 `/api/session` 前的等待秒数；同一任务、同一账号只重新发现一次且不调用 wake |
 | `MUSE2API_WORKSPACE_CIRCUIT_BREAKER_ENABLED` | `1` | 非 `0` 时启用上游故障熔断；所有可调度账号都在冷却时立即失败，不再打开页面或请求 muse.ai |
+| `MUSE2API_VIDEO_QUOTA_COOLDOWN_HOURS` | `24` | muse.ai 明确回复视频额度达到上限时，该账号暂停视频任务的默认小时数；若回复含可解析的恢复时间则优先使用回复时间 |
+| `MUSE2API_IMAGE_QUOTA_COOLDOWN_HOURS` | `24` | muse.ai 明确回复图片额度达到上限时，该账号暂停图片任务的默认小时数；若回复含可解析的恢复时间则优先使用回复时间 |
 | `MUSE2API_REF_IMAGE_LOCAL_FILES` | `0` | 严格等于 `1` 时才允许服务器本地路径作为参考素材；仅适合可信单用户部署 |
 | `MUSE2API_REF_IMAGE_PRIVATE_FETCH` | `0` | 严格等于 `1` 时才允许抓取私网/本机参考图 URL；默认只允许经过检查的公网 URL |
 | `MUSE2API_TOOL_PROTOCOL` | `0` | 非 `0` 时启用工具调用协议适配；默认只兼容参数，不注入协议 |
@@ -86,6 +88,7 @@ Railway 数据卷挂载到 `/app/data`。镜像把 `MUSE2API_HOME` 设为 `/app`
 | `POST /admin/accounts/{aid}/cookies` | 为已有账号替换 Cookie，并重置新会话的有效期估算锚点 |
 | `POST /admin/accounts/{aid}/proxy/test` | 检查代理出口，再经该代理检查 Muse 会话；不代表真实生成一定成功 |
 | `POST /admin/accounts/{aid}/quota` | 实时打开设置面板读取指定账号额度并缓存；读取失败不会覆盖旧缓存 |
+| `DELETE /admin/accounts/{aid}/quota-cooldown?kind=video` | 清除指定账号的额度冷却；`kind` 可为 `video`、`image`、`any`，省略时清除全部，适合确认套餐升级或额度已恢复后使用 |
 | `POST /admin/accounts/keepalive` | 手动运行全账号保活；默认查询参数 `force=true`。已有保活任务时返回 `busy` |
 | `POST /admin/accounts/{aid}/keepalive` | 对单个账号执行 `/api/session` 续签和 VM 唤醒 |
 | `GET /admin/keepalive/status` | 查看保活协程最近一次、下一次运行及结果 |
@@ -126,6 +129,14 @@ muse.ai 会在 `/api/session` 响应中轮换 `hatch_sess`、`hatch_gw` 等 Cook
 页面返回 `hatch_vm_auth_no_match` / `MuseWorkspaceUnavailable` 表示 muse.ai 暂未给该账号分配工作区，不等同于 Cookie 失效。程序会先关闭页面并回存轮换 Cookie，等待 `MUSE2API_WORKSPACE_REDISCOVERY_DELAY_SECONDS` 后，仅用一次无 wake 的 `/api/session` 查询重新发现工作区；只有状态恢复为 `assigned` 才为同一账号重开页面重试一次。
 
 重新发现仍不可用或失败时，账号进入 `MUSE2API_WORKSPACE_COOLDOWN_SECONDS` 冷却。冷却不会修改账号 `ok`，也不需要重新导入 Cookie；`GET /admin/accounts` 的 `workspace_cooldown_remaining_seconds` 可查看剩余秒数。若所有可调度账号都在冷却且熔断开关开启，新任务会立即返回上游故障及预计自动恢复时间，不会启动浏览器或继续请求 muse.ai。应等待冷却自动结束；只有出现明确登录页、`/api/session` 401 等认证证据时才重新导入 Cookie。
+
+### 图片与视频额度冷却
+
+muse.ai 明确回复 `视频上限`、`video limit`、`usage limit`、`额度已用完` 等额度文案时，程序会把它与普通内容拒绝区分：只为当前账号记录对应图片或视频种类的额度冷却，然后在现有重试次数内自动切换到仍有该种类额度的账号。额度冷却与工作区冷却并列，不修改账号 `ok`，也不表示 Cookie 失效；视频冷却不会影响该账号继续承担图片或对话任务。
+
+`GET /admin/accounts` 会返回 `video_quota_cooldown_remaining_seconds`、`image_quota_cooldown_remaining_seconds` 和 `any_quota_cooldown_remaining_seconds`。冷却到期后账号自动恢复调度；若模型回复包含可解析的恢复时长则按该时间，否则分别使用 `MUSE2API_VIDEO_QUOTA_COOLDOWN_HOURS` 或 `MUSE2API_IMAGE_QUOTA_COOLDOWN_HOURS`。所有账号都处于当前种类额度冷却时，请求会在打开页面前立即失败，并报告最早预计恢复时间。
+
+免费账号的视频额度生产观察约为每账号每 24 小时 1 条。运维上应预留足够账号并错峰使用，不要通过连续重试消耗浏览器资源；确认账号升级套餐或额度已提前恢复后，可使用额度冷却清除接口让它立即重新参与调度。普通模型内容拒绝仍是终止错误，不会为了绕过拒绝而自动换号。
 
 ### 常见生成错误
 
