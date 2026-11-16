@@ -46,6 +46,8 @@ Railway 数据卷挂载到 `/app/data`。镜像把 `MUSE2API_HOME` 设为 `/app`
 | `MUSE2API_EXTRA_PATH` | `/snap/bin` | 启动浏览器时补入的 PATH |
 | `MUSE2API_SITE` | `https://muse.ai/` | muse.ai 站点地址 |
 | `MUSE2API_LOGIN_WAIT` | `60` | 等待 muse.ai 聊天输入框出现的秒数；超时不等于账号已失效 |
+| `MUSE2API_KEEP_ACCOUNT_CONTEXTS` | `1` | 非 `0` 时为每个账号长期保留 BrowserContext 与主页，使 IndexedDB、localStorage 等客户端绑定状态跨任务复用；设为 `0` 恢复每任务创建并销毁上下文的旧行为 |
+| `MUSE2API_MAX_ACCOUNT_CONTEXTS` | `8` | 长期账号上下文保留上限，最小为 1；超过时按 LRU 关闭最旧的空闲上下文，正在执行任务的上下文不会被容量清理 |
 | `MUSE2API_UPLOAD_WAIT` | `30` | 等待上传控件的秒数；实际最少等待 5 秒 |
 | `MUSE2API_PROFILE_ROOT` | `~/muse2api-profiles` | Chromium profile 根目录；镜像预建 `/root/muse2api-profiles` |
 | `MUSE2API_KEY` | 空 | 管理接口和 `/v1` API 的 Bearer Key。为空时启动代码会自动生成、写入 `/app/.env` 并输出到启动日志；Railway 上应显式设置稳定的强随机值，避免重新部署后变化，也不要在工单或日志中粘贴真实值 |
@@ -77,7 +79,7 @@ Railway 数据卷挂载到 `/app/data`。镜像把 `MUSE2API_HOME` 设为 `/app`
 
 | 方法与路径 | 行为 |
 | --- | --- |
-| `GET /admin/status` | 总览：脱敏账号列表、统计、最近 20 个任务摘要、媒体数量、浏览器状态和部分配置 |
+| `GET /admin/status` | 总览：脱敏账号列表、统计、最近 20 个任务摘要、媒体数量、浏览器状态、当前保留的账号上下文数量和部分配置 |
 | `GET /admin/accounts` | 返回脱敏账号列表与统计；Cookie 和代理凭据不会返回，仅给出 Cookie 数量和脱敏代理信息 |
 | `POST /admin/accounts` | 导入单个或批量 Cookie；`hatch_sess` 是代码要求的核心 Cookie。遇到崩溃页时仍应重新导入浏览器扩展取得的完整 Cookie |
 | `PATCH /admin/accounts/{aid}` | 修改标签、启用状态或代理；账号忙时不能改代理 |
@@ -123,9 +125,15 @@ muse.ai 会在 `/api/session` 响应中轮换 `hatch_sess`、`hatch_gw` 等 Cook
 
 ### 上游故障熔断
 
-页面返回 `hatch_vm_auth_no_match` / `MuseWorkspaceUnavailable` 表示 muse.ai 暂未给该账号分配工作区，不等同于 Cookie 失效。程序会先关闭页面并回存轮换 Cookie，等待 `MUSE2API_WORKSPACE_REDISCOVERY_DELAY_SECONDS` 后，仅用一次无 wake 的 `/api/session` 查询重新发现工作区；只有状态恢复为 `assigned` 才为同一账号重开页面重试一次。
+页面返回 `hatch_vm_auth_no_match` / `MuseWorkspaceUnavailable` 表示 muse.ai 暂未给该账号分配工作区，不等同于 Cookie 失效。程序会释放当前任务对页面的占用并回存轮换 Cookie，但保留该账号 BrowserContext，避免丢失可能已经建立的客户端绑定状态；等待 `MUSE2API_WORKSPACE_REDISCOVERY_DELAY_SECONDS` 后，仅用一次无 wake 的 `/api/session` 查询重新发现工作区，只有状态恢复为 `assigned` 才为同一账号重置页面重试一次。
 
 重新发现仍不可用或失败时，账号进入 `MUSE2API_WORKSPACE_COOLDOWN_SECONDS` 冷却。冷却不会修改账号 `ok`，也不需要重新导入 Cookie；`GET /admin/accounts` 的 `workspace_cooldown_remaining_seconds` 可查看剩余秒数。若所有可调度账号都在冷却且熔断开关开启，新任务会立即返回上游故障及预计自动恢复时间，不会启动浏览器或继续请求 muse.ai。应等待冷却自动结束；只有出现明确登录页、`/api/session` 401 等认证证据时才重新导入 Cookie。
+
+### 账号浏览器上下文
+
+默认情况下，同一账号后续任务会复用首次创建的 BrowserContext 和主页。任务结束只释放租约，不清空 Cookie、IndexedDB、localStorage、Service Worker 或 Cache Storage。明确认证失败、代理变化、账号禁用/删除、管理员替换登录 Cookie、LRU 淘汰或引擎停止时才销毁上下文；额度读取使用同一账号上下文内的临时标签页，不关闭长期主页。
+
+每个保留上下文及页面的内存粗估为数百 MiB，实际值受页面内容与 Chromium 版本影响。Railway 应结合实例内存观察 RSS，再调整 `MUSE2API_MAX_ACCOUNT_CONTEXTS`；8 个上下文可能消耗数 GiB。当前阶段只保留进程内状态，Chromium、服务或 Railway 容器重启后全部丢失，耐重启的加密状态快照属于后续阶段。
 
 ### 常见生成错误
 

@@ -75,6 +75,10 @@ class Config:
     extra_path: str = field(default_factory=lambda: _env("MUSE2API_EXTRA_PATH", "/snap/bin"))
     site_url: str = field(default_factory=lambda: _env("MUSE2API_SITE", "https://muse.ai/"))
     login_wait: int = field(default_factory=lambda: int(_env("MUSE2API_LOGIN_WAIT", "60")))
+    keep_account_contexts: bool = field(
+        default_factory=lambda: _env("MUSE2API_KEEP_ACCOUNT_CONTEXTS", "1").strip() != "0")
+    max_account_contexts: int = field(
+        default_factory=lambda: max(1, int(_env("MUSE2API_MAX_ACCOUNT_CONTEXTS", "8"))))
 
     # 浏览器 profile 根目录。
     # 踩过的坑：snap 版 chromium 受 AppArmor 约束，只能读写 $HOME 下的路径。
