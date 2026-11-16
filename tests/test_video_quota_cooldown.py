@@ -105,3 +105,16 @@ with tempfile.TemporaryDirectory(prefix="m2a-video-quota-") as home:
     assert app.store.quota_cooldown_remaining(first, "video") == 0
 
 print("PASS: quota text detection, rotation, typed cooldown, fast failure, expiry and clearing")
+
+
+# Review follow-up: page text (`tail`) can contain the user's own prompt or sidebar history.
+# The broad quota patterns must only run on the model's reply, never on page text, or a
+# prompt such as "视频时长上限 5 秒" would put a healthy account into a 24h cooldown.
+import re as _re
+from pathlib import Path as _Path
+_src = (_Path(__file__).resolve().parents[1] / "engine.py").read_text(encoding="utf-8")
+assert not _re.search(r"detect_quota_limit\(\s*tail\b", _src), "broad quota patterns must not scan page text"
+import engine as _engine
+assert _engine.detect_quota_limit("请生成 16:9 视频，视频时长上限 5 秒，不要文字") is not None, \
+    "documents why page text is excluded: the broad patterns do match prompt-like text"
+print("PASS: broad quota patterns are not applied to page text")

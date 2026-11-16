@@ -1618,10 +1618,11 @@ class MuseEngine:
                 elif unsent and elapsed > 60.0:
                     raise MuseGenerationError("提示词没有发出去（%s 仍在输入框里），终止等待并换号重试" % unsent)
 
-            quota_error = detect_quota_limit(tail, expect)
-            if quota_error:
-                raise quota_error
-            if re.search(r"积分不足|token limit", tail, re.I):
+            # `tail` is page text and can contain the user's own prompt or sidebar history, so
+            # only the original narrow phrases are checked here. The broad quota patterns run
+            # on the model's own reply (refusal / delivered text) further down, where a match
+            # really means the account hit its limit and earns a 24h cooldown.
+            if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail, re.I):
                 raise MuseGenerationError("账号额度不足")
             # A Stop button is also shown for messages never acknowledged by the gateway.
             if elapsed > 30.0 and cur_cnt == base_agent_cnt and re.search(
