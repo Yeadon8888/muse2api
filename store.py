@@ -145,6 +145,9 @@ class Store:
             # 有效期是 hatch_vml 的实测 expires，还是按「2 天寿命」推算的
             item["expires_estimated"] = not _is_pos(ce.get("hatch_vml"))
             item["workspace_cooldown_remaining_seconds"] = self.workspace_cooldown_remaining(a)
+            item["video_quota_cooldown_remaining_seconds"] = self.quota_cooldown_remaining(a, "video")
+            item["image_quota_cooldown_remaining_seconds"] = self.quota_cooldown_remaining(a, "image")
+            item["any_quota_cooldown_remaining_seconds"] = self.quota_cooldown_remaining(a, "any")
             out.append(item)
         return out
 
@@ -180,6 +183,74 @@ class Store:
         remaining = [self.workspace_cooldown_remaining(a) for a in live]
         return all(value > 0 for value in remaining), min(remaining)
 
+    @staticmethod
+    def quota_cooldown_remaining(account: dict, kind: str,
+                                 now: float | None = None) -> int:
+        """返回指定任务种类的额度冷却秒数；通用额度冷却会同时覆盖图片和视频。"""
+        kind = kind if kind in ("video", "image", "any") else "any"
+        cooldowns = account.get("quota_cooldown_until") or {}
+        if not isinstance(cooldowns, dict):
+            return 0
+        keys = ("any", kind) if kind != "any" else ("any",)
+        until = 0.0
+        for key in keys:
+            try:
+                until = max(until, float(cooldowns.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+        return max(0, math.ceil(until - (time.time() if now is None else now)))
+
+    def set_quota_cooldown(self, aid: str, kind: str, seconds: int | float = 0,
+                           reset_at: float | None = None, note: str = "") -> dict | None:
+        """记录额度冷却，不改变账号 ok 或 Cookie 状态。"""
+        kind = kind if kind in ("video", "image", "any") else "any"
+        with _LOCK:
+            now = time.time()
+            until = max(now, float(reset_at)) if reset_at else now + max(0, float(seconds))
+            for a in self.accounts:
+                if a["id"] == aid:
+                    cooldowns = a.get("quota_cooldown_until")
+                    if not isinstance(cooldowns, dict):
+                        cooldowns = {}
+                    cooldowns[kind] = until
+                    a["quota_cooldown_until"] = cooldowns
+                    a["quota_limited_at"] = int(now)
+                    if note:
+                        a["note"] = note[:300]
+                    a["checked_at"] = int(now)
+                    _write(self.cfg.accounts_file, self.accounts)
+                    return a
+        return None
+
+    def clear_quota_cooldown(self, aid: str, kind: str | None = None) -> dict | None:
+        """管理员确认额度恢复或套餐升级后，清除单类或全部额度冷却。"""
+        if kind is not None and kind not in ("video", "image", "any"):
+            raise ValueError("额度种类必须是 video、image 或 any")
+        with _LOCK:
+            for a in self.accounts:
+                if a["id"] != aid:
+                    continue
+                cooldowns = a.get("quota_cooldown_until")
+                if not isinstance(cooldowns, dict):
+                    cooldowns = {}
+                if kind is None:
+                    cooldowns.clear()
+                else:
+                    cooldowns.pop(kind, None)
+                a["quota_cooldown_until"] = cooldowns
+                _write(self.cfg.accounts_file, self.accounts)
+                return a
+        return None
+
+    def all_schedulable_accounts_quota_cooling(self, kind: str) -> tuple[bool, int]:
+        """返回所有启用账号是否都处于该种类额度冷却，以及最早恢复秒数。"""
+        live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
+        if not live:
+            return False, 0
+        remaining = [self.quota_cooldown_remaining(a, kind) for a in live]
+        positive = [value for value in remaining if value > 0]
+        return len(positive) == len(live), min(positive) if positive else 0
+
     def delete_account(self, aid: str) -> bool:
         with _LOCK:
             n = len(self.accounts)
@@ -190,13 +261,14 @@ class Store:
     def pick_account(self, preferred_id: str | None = None, rotate: bool = True,
                      force_rotate: bool = False, exclude_id: str | None = None,
                      exclude_ids: set[str] | list[str] | None = None,
-                     record_use: bool = True) -> dict | None:
+                     record_use: bool = True, task_kind: str | None = None) -> dict | None:
         """选择可用账号：优先复用当前已预热的健康账号（减少切号重连耗时），每满 15 次或遇错自动轮转。
         exclude_ids: 需要排除的账号 ID 集合（例如正在被其他并发线程占用的账号）。"""
         with _LOCK:
             live = [a for a in self.accounts
                     if a.get("enabled", True) and a.get("cookies")
-                    and self.workspace_cooldown_remaining(a) == 0]
+                    and self.workspace_cooldown_remaining(a) == 0
+                    and (not task_kind or self.quota_cooldown_remaining(a, task_kind) == 0)]
             if not live:
                 return None
             any_healthy = any(a.get("ok") is not False for a in live)

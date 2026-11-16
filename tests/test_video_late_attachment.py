@@ -18,11 +18,20 @@ def load_waiter(path):
     engine = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MuseEngine")
     names = {"_wait_attachment", "_clean_model_text", "_media_refusal_text", "_media_status_pending"}
     methods = [n for n in engine.body if isinstance(n, ast.FunctionDef) and n.name in names]
+    quota_nodes = [n for n in tree.body if (
+        isinstance(n, ast.ClassDef) and n.name == "MuseQuotaLimitError"
+        or isinstance(n, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in {
+                "QUOTA_LIMIT_PATTERNS", "_QUOTA_RESET_PATTERNS"}
+            for target in n.targets)
+        or isinstance(n, ast.FunctionDef) and n.name == "detect_quota_limit"
+    )]
     module = ast.Module(body=[
         ast.ClassDef(name="MuseGenerationError", bases=[ast.Name(id="RuntimeError", ctx=ast.Load())],
                      keywords=[], body=[ast.Pass()], decorator_list=[]),
         ast.ClassDef(name="MuseModelRefusalError", bases=[ast.Name(id="MuseGenerationError", ctx=ast.Load())],
                      keywords=[], body=[ast.Pass()], decorator_list=[]),
+        *quota_nodes,
         ast.ClassDef(name="Waiter", bases=[], keywords=[], body=methods, decorator_list=[]),
     ], type_ignores=[])
     scope = {"re": re, "json": json}
