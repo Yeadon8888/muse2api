@@ -209,6 +209,28 @@ def _webm_duration(data: bytes) -> float | None:
 # hatch_sess 是登录凭据；hatch_vml 可由工作区签发，缺少不阻止导入
 ESSENTIAL_COOKIES = ("hatch_sess",)
 
+# 2026-11-16 在生产容器连续两次 GET /api/session 均没有 Set-Cookie，未能得到
+# 可按名称维护的 host-only 清单。已确认的规则只有：__Host- 必须 host-only；在
+# 没有普通 host-only 样本时，其余名称按明确的 Domain=.muse.ai 轮换场景统一处理。
+# 后续若观测到不带 Domain 的普通 cookie，应把名称加入这个集合。
+_MUSE_HOST_ONLY_COOKIES: frozenset[str] = frozenset()
+
+
+def _muse_cookie_is_host_only(name: str) -> bool:
+    return name.startswith("__Host-") or name in _MUSE_HOST_ONLY_COOKIES
+
+
+def _muse_cookie_matches_scope(cookie: dict) -> bool:
+    """只接受该名称的规范 muse.ai 作用域，过滤历史双份 cookie。"""
+    name = str(cookie.get("name") or "")
+    domain = str(cookie.get("domain") or "").lower()
+    path = cookie.get("path") or "/"
+    if not name or path != "/":
+        return False
+    if _muse_cookie_is_host_only(name):
+        return domain == "muse.ai" and bool(cookie.get("secure"))
+    return domain == ".muse.ai"
+
 
 class MuseAuthError(RuntimeError):
     pass
@@ -668,7 +690,7 @@ class MuseEngine:
             }
 
     def _apply_cookies(self, page: CDP, cookies: dict, expires: dict | None = None):
-        """注入 cookie。彻底清空旧账号 cookie 保证隔离，且绝不传入过去时间的 expires 防止 Chromium 丢弃 hatch_vml。"""
+        """按 muse.ai 的规范作用域单份注入 cookie，并清掉历史另一作用域副本。"""
         try:
             page.send("Network.clearBrowserCookies")
         except Exception:
@@ -682,19 +704,29 @@ class MuseEngine:
                 exp_val = float(exp) if exp and float(exp) > now + 3600 else (now + 7 * 86400)
             except (TypeError, ValueError):
                 exp_val = now + 7 * 86400
-            for dom in (".muse.ai", "muse.ai"):
-                params = {
-                    "name": name,
-                    "value": value,
-                    "domain": dom,
-                    "path": "/",
-                    "secure": True,
-                    "expires": exp_val,
-                }
+            # 新上下文通常已为空；仍显式删掉 domain/host-only 两种旧副本，防止
+            # 复用页面或异常清理失败时旧值继续随请求发送。
+            for stale in ({"name": name, "domain": ".muse.ai", "path": "/"},
+                          {"name": name, "url": "https://muse.ai/"}):
                 try:
-                    page.send("Network.setCookie", params)
+                    page.send("Network.deleteCookies", stale)
                 except Exception:  # noqa: BLE001
                     pass
+            params = {
+                "name": name,
+                "value": value,
+                "path": "/",
+                "secure": True,
+                "expires": exp_val,
+            }
+            if _muse_cookie_is_host_only(name):
+                params["url"] = "https://muse.ai/"
+            else:
+                params["domain"] = ".muse.ai"
+            try:
+                page.send("Network.setCookie", params)
+            except Exception:  # noqa: BLE001
+                pass
 
     def read_cookies(self, page: CDP | None = None) -> dict[str, dict]:
         """从当前页面读回 cookie（**包含 httpOnly**，这是网页 JS 做不到的）。
@@ -720,7 +752,7 @@ class MuseEngine:
             if not isinstance(c, dict):
                 continue
             name = c.get("name")
-            if not name:
+            if not name or not _muse_cookie_matches_scope(c):
                 continue
             try:
                 exp = int(float(c.get("expires", -1)))
@@ -936,7 +968,7 @@ class MuseEngine:
             log.warning("保存轮换后的 cookie 失败 %s: %s", account_id, e)
 
     def _report_page_cookies(self, account_id: str | None, page: CDP) -> None:
-        """在页面成功或失败关闭前回存浏览器收到的最新 cookie。"""
+        """在页面关闭前回存 read_cookies 选出的规范作用域 cookie。"""
         if not account_id:
             return
         live = self.read_cookies(page)
