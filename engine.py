@@ -344,6 +344,9 @@ class MuseEngine:
         self._start_lock = threading.Lock()
         self._active_contexts: set[str] = set()
         self._contexts_lock = threading.Lock()
+        # account_id -> 长期 BrowserContext / 主页面。线程本地字段只表示本次租约，
+        # 任务结束后会释放占用，但这里的页面和站点存储继续保留。
+        self._account_contexts: dict[str, dict] = {}
         self._proxy_relays: set[HTTPProxyRelay] = set()
         self._download_dirs: set[str] = set()
         self.proxy_resolver = None
@@ -442,8 +445,13 @@ class MuseEngine:
 
     def stop(self):
         with self._start_lock:
-            self._close_page()
+            self._close_page(dispose=True)
             if self.browser:
+                with self._contexts_lock:
+                    entries = list(self._account_contexts.values())
+                    self._account_contexts.clear()
+                for entry in entries:
+                    self._dispose_entry(entry)
                 with self._contexts_lock:
                     for ctx_id in list(self._active_contexts):
                         try:
@@ -487,10 +495,134 @@ class MuseEngine:
             self._download_dirs.add(directory)
         return directory
 
-    def _close_page(self):
-        """关闭当前线程专属的页面并销毁隔离的 BrowserContext，彻底释放内存与 Session。"""
+    def _clear_local_context(self):
+        """清除当前线程的租约引用；长期资源由注册表继续持有。"""
+        local = self._ensure_local()
+        self.page = None
+        self.current_context_id = None
+        self.current_acc_id = None
+        local.proxy_relay = None
+        local.proxy_config = None
+        local.download_dir = None
+
+    def _dispose_entry(self, entry: dict) -> None:
+        """销毁一个已从注册表摘除的账号上下文。"""
+        try:
+            self._report_page_cookies(entry.get("account_id"), entry["page"])
+        except Exception:
+            pass
+        try:
+            entry["page"].close()
+        except Exception:
+            pass
+        ctx_id = entry.get("context_id")
+        if ctx_id and self.browser:
+            try:
+                self.browser.send("Target.disposeBrowserContext", {"browserContextId": ctx_id})
+            except Exception:
+                pass
+        relay = entry.get("proxy_relay")
+        if relay:
+            relay.close()
+        directory = entry.get("download_dir")
+        if directory:
+            shutil.rmtree(directory, ignore_errors=True)
+        with self._contexts_lock:
+            self._active_contexts.discard(ctx_id)
+            if relay:
+                self._proxy_relays.discard(relay)
+            if directory:
+                self._download_dirs.discard(directory)
+
+    def _evict_idle_contexts(self, reserve: int = 0) -> None:
+        """按 LRU 淘汰空闲上下文；忙碌上下文永不被容量清理。"""
+        victims = []
+        limit = max(1, int(getattr(self.cfg, "max_account_contexts", 8)))
+        with self._contexts_lock:
+            idle = sorted(
+                (entry for entry in self._account_contexts.values() if not entry.get("in_use")),
+                key=lambda entry: entry.get("last_used", 0),
+            )
+            while len(self._account_contexts) + reserve > limit and idle:
+                entry = idle.pop(0)
+                if self._account_contexts.pop(entry["account_id"], None) is entry:
+                    victims.append(entry)
+        for entry in victims:
+            self._dispose_entry(entry)
+
+    def retained_context_count(self) -> int:
+        with self._contexts_lock:
+            return len(self._account_contexts)
+
+    def invalidate_account_context(self, account_id: str | None) -> bool:
+        """显式销毁账号长期上下文（认证失败、代理变化、禁用或删除）。"""
+        if not account_id:
+            return False
+        with self._contexts_lock:
+            entry = self._account_contexts.pop(account_id, None)
+        if not entry:
+            return False
+        if self.current_acc_id == account_id:
+            self._clear_local_context()
+        self._dispose_entry(entry)
+        return True
+
+    def _claim_account_context(self, account_id: str, proxy: dict | None) -> CDP | None:
+        """领取账号的空闲长期页面；代理变化时先销毁旧上下文。"""
+        stale = None
+        with self._contexts_lock:
+            entry = self._account_contexts.get(account_id)
+            if entry and entry.get("proxy") != proxy:
+                stale = self._account_contexts.pop(account_id)
+                entry = None
+            if entry:
+                if entry.get("in_use"):
+                    raise MuseGenerationError("账号浏览器上下文仍在使用中")
+                entry["in_use"] = True
+                entry["last_used"] = time.monotonic()
+        if stale:
+            self._dispose_entry(stale)
+        if not entry:
+            return None
+        local = self._ensure_local()
+        self.page = entry["page"]
+        self.current_context_id = entry["context_id"]
+        self.current_acc_id = account_id
+        local.proxy_config = copy.deepcopy(entry.get("proxy"))
+        local.proxy_relay = entry.get("proxy_relay")
+        local.download_dir = entry.get("download_dir")
+        return entry["page"]
+
+    def _close_page(self, dispose: bool = False):
+        """释放当前线程租约；旧模式或明确要求时才销毁 BrowserContext。"""
         p = self.page
         ctx_id = self.current_context_id
+        account_id = self.current_acc_id
+        if dispose and account_id:
+            with self._contexts_lock:
+                entry = self._account_contexts.pop(account_id, None)
+            if entry:
+                self._clear_local_context()
+                self._dispose_entry(entry)
+                return
+        keep = bool(getattr(self.cfg, "keep_account_contexts", True) and account_id and not dispose)
+        if keep:
+            try:
+                self._report_page_cookies(account_id, p)
+            except Exception:
+                pass
+            with self._contexts_lock:
+                entry = self._account_contexts.get(account_id)
+                if entry and entry.get("context_id") == ctx_id:
+                    entry["in_use"] = False
+                    entry["last_used"] = time.monotonic()
+                    released = True
+                else:
+                    released = False
+            if released:
+                self._clear_local_context()
+                self._evict_idle_contexts()
+                return
         if p:
             # muse.ai 会在失败页面里照样轮换 httpOnly cookie；必须在销毁隔离
             # 上下文前读回，否则下次会继续使用已经作废的旧值。
@@ -524,7 +656,7 @@ class MuseEngine:
                 self._download_dirs.discard(directory)
             local.download_dir = None
 
-    def _open_page(self, proxy: dict | None = None):
+    def _open_page(self, proxy: dict | None = None, account_id: str | None = None):
         """Create an isolated account context; never fall back to shared cookies."""
         if not self.browser:
             error = MuseProxyError if proxy else MuseGenerationError
@@ -564,6 +696,21 @@ class MuseEngine:
                 "behavior": "allow", "downloadPath": self._new_download_dir(),
                 "browserContextId": ctx_id,
             })
+            if getattr(getattr(self, "cfg", None), "keep_account_contexts", True) and account_id:
+                local = self._ensure_local()
+                entry = {
+                    "account_id": account_id,
+                    "context_id": ctx_id,
+                    "target_id": target_id,
+                    "page": page,
+                    "proxy": copy.deepcopy(proxy),
+                    "proxy_relay": getattr(local, "proxy_relay", None),
+                    "download_dir": getattr(local, "download_dir", None),
+                    "in_use": True,
+                    "last_used": time.monotonic(),
+                }
+                with self._contexts_lock:
+                    self._account_contexts[account_id] = entry
             return page
         except Exception:
             if page:
@@ -571,9 +718,80 @@ class MuseEngine:
                     page.close()
                 except Exception:
                     pass
-            self._close_page()
+            self._close_page(dispose=True)
             error = MuseProxyError if proxy else MuseGenerationError
             raise error("无法创建该账号的独立浏览器会话；未回退共享标签页或直连") from None
+
+    def _open_temporary_page(self, context_id: str) -> tuple[CDP, str]:
+        """在账号上下文内开临时标签页，不改变或关闭长期主页。"""
+        if not self.browser:
+            raise MuseGenerationError("浏览器未连接，无法创建临时页面")
+        result = self.browser.send("Target.createTarget", {
+            "url": "about:blank", "browserContextId": context_id,
+        })
+        target_id = result.get("result", {}).get("targetId")
+        if not target_id:
+            raise MuseGenerationError("Chromium 未返回临时页面 ID")
+        page = None
+        try:
+            page = CDP(f"ws://127.0.0.1:{self.cfg.cdp_port}/devtools/page/{target_id}", timeout=180)
+            page.send("Network.enable")
+            page.send("Page.enable")
+            page.send("Runtime.enable")
+            self._install_hatch_token_hook(page)
+            return page, target_id
+        except Exception:
+            if page:
+                page.close()
+            try:
+                self.browser.send("Target.closeTarget", {"targetId": target_id})
+            except Exception:
+                pass
+            raise
+
+    def _close_temporary_page(self, page: CDP, target_id: str) -> None:
+        try:
+            self._report_page_cookies(self.current_acc_id, page)
+        except Exception:
+            pass
+        if self.browser:
+            try:
+                self.browser.send("Target.closeTarget", {"targetId": target_id})
+            except Exception:
+                pass
+        try:
+            page.close()
+        except Exception:
+            pass
+
+    def _replace_retained_page(self, account_id: str) -> CDP:
+        """页面连接失效时在原 BrowserContext 内换标签页，保留站点存储。"""
+        with self._contexts_lock:
+            entry = self._account_contexts.get(account_id)
+            if not entry or entry.get("context_id") != self.current_context_id:
+                raise MuseGenerationError("账号浏览器上下文已不存在")
+            old_page = entry["page"]
+            old_target = entry["target_id"]
+            context_id = entry["context_id"]
+        page, target_id = self._open_temporary_page(context_id)
+        if self.browser:
+            try:
+                self.browser.send("Target.closeTarget", {"targetId": old_target})
+            except Exception:
+                pass
+        try:
+            old_page.close()
+        except Exception:
+            pass
+        with self._contexts_lock:
+            entry = self._account_contexts.get(account_id)
+            if not entry or entry.get("context_id") != context_id:
+                self._close_temporary_page(page, target_id)
+                raise MuseGenerationError("账号浏览器上下文已被重置")
+            entry["page"] = page
+            entry["target_id"] = target_id
+        self.page = page
+        return page
 
     @staticmethod
     def renew_session_http(cookies: dict, expires: dict | None = None,
@@ -1011,7 +1229,10 @@ class MuseEngine:
                     expires = renewed["cookies_exp"]
                 if account_id:
                     last_map[account_id] = now_ts
-            except (MuseAuthError, MuseProxyError):
+            except MuseAuthError:
+                self.invalidate_account_context(account_id)
+                raise
+            except MuseProxyError:
                 raise
             except MuseSessionUnavailable as e:
                 if e.cookies:
@@ -1026,11 +1247,34 @@ class MuseEngine:
             except Exception as e:
                 log.warning("预续签 /api/session 失败（继续尝试浏览器加载）: %s", e)
 
-        page = self._open_page(proxy=proxy) if proxy else self._open_page()
-        self.page = page  # Cleanup must also own pages that never become ready.
-        self.current_acc_id = account_id  # 失败关闭前也要按账号回存页面轮换的 cookie。
-        self._ensure_local().proxy_config = proxy
+        page = None
+        reused = False
+        if getattr(self.cfg, "keep_account_contexts", True) and account_id:
+            page = self._claim_account_context(account_id, proxy)
+            reused = page is not None
+        if page is None:
+            if getattr(self.cfg, "keep_account_contexts", True) and account_id:
+                self._evict_idle_contexts(reserve=1)
+            page = (self._open_page(proxy=proxy, account_id=account_id) if proxy
+                    else self._open_page(account_id=account_id))
+            self.page = page  # Cleanup must also own pages that never become ready.
+            self.current_acc_id = account_id  # 失败关闭前也要按账号回存页面轮换的 cookie。
+            self._ensure_local().proxy_config = proxy
+        # 复用时不清空 Cookie / localStorage / IndexedDB；只覆盖账号池中同名 Cookie。
         self._apply_cookies(page, cookies, expires)
+        if reused:
+            try:
+                if (page.js("!!document.querySelector('textarea')")
+                        and self._wait_ws_ready(page, timeout=8.0)):
+                    return page
+            except Exception:
+                # 页面连接本身失效时只在原上下文内换标签页，不能销毁可能已经
+                # 建立的 CVM 绑定；站点返回的工作区异常走后续分类分支。
+                try:
+                    page = self._replace_retained_page(account_id)
+                except Exception as exc:
+                    self._close_page()
+                    raise MuseGenerationError("账号页面重建失败，已保留浏览器上下文") from exc
         page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
         if self._wait_ws_ready(page, timeout=self.cfg.login_wait, fail_on_crash=True):
             # A token-rejected session renders the composer briefly, then crashes to
@@ -1039,7 +1283,12 @@ class MuseEngine:
             while time.time() < stable_until:
                 if self._is_crash_page(page):
                     exc = self._crash_page_exception(page)
-                    self._close_page()
+                    if isinstance(exc, MuseAuthError):
+                        self.invalidate_account_context(account_id)
+                    else:
+                        # 工作区暂不可用时保留 BrowserContext，避免丢失可能已经
+                        # 建立的 CVM 绑定状态；仅释放线程引用，后续再重置页面内容。
+                        self._close_page()
                     raise exc
                 time.sleep(0.25)
             return page
@@ -1049,7 +1298,10 @@ class MuseEngine:
         except Exception:
             body = ""
         crash_exc = self._crash_page_exception(page) if crashed else None
-        self._close_page()
+        if isinstance(crash_exc, MuseAuthError):
+            self.invalidate_account_context(account_id)
+        else:
+            self._close_page()
         if crashed:
             raise crash_exc
         if proxy and re.search(r"err_(?:proxy|tunnel)|proxy authentication|代理认证失败", body, re.I):
@@ -1058,6 +1310,7 @@ class MuseEngine:
             raise MuseGenerationError("页面网关连接超时 (Connecting...)，正在自动切换账号")
         # Distinguish an expired session from a page that never became ready.
         if re.search(r"log in|sign in|create an account|登录|use another account", body):
+            self.invalidate_account_context(account_id)
             raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
                                 "请用浏览器扩展重新导入 cookie")
         raise MuseGenerationError("muse.ai 页面加载超时（未出现聊天输入框），请检查服务器网络后重试；未确认会话失效")
@@ -1147,13 +1400,23 @@ class MuseEngine:
 
     def quota(self, cookies: dict, expires: dict | None = None,
               account_id: str | None = None) -> dict:
-        """Read one account's quota in a fresh, disposable browser context."""
-        # Muse's Settings menu can remain in a half-closed React state after a read.
-        # A disposable context is slower, but prevents consecutive reads from
-        # inheriting stale UI and keeps account cookies strictly isolated.
+        """在账号上下文的临时标签页读取额度，不污染长期主页。"""
         self._close_page()
+        main_page = None
+        temporary = None
+        target_id = None
         try:
             self.ensure_page(cookies, expires, account_id=account_id)
+            if getattr(getattr(self, "cfg", None), "keep_account_contexts", False) and account_id:
+                main_page = self.page
+                temporary, target_id = self._open_temporary_page(self.current_context_id)
+                self.page = temporary
+                temporary.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+                if not self._wait_ws_ready(temporary, timeout=self.cfg.login_wait,
+                                           fail_on_crash=True):
+                    if self._is_crash_page(temporary):
+                        raise self._crash_page_exception(temporary)
+                    raise MuseGenerationError("额度临时页面加载超时")
             self._quota_click(self._QUOTA_SETTINGS_JS, '找不到设置入口（Settings／設定／设置）')
             self._quota_click(self._QUOTA_MENU_JS, '设置菜单未出现可识别的设置项')
             deadline = time.monotonic() + 12.0
@@ -1164,7 +1427,16 @@ class MuseEngine:
                 if time.monotonic() >= deadline:
                     raise MuseGenerationError('额度面板未读到有效用量；旧缓存未覆盖')
                 time.sleep(0.2)
+        except MuseAuthError:
+            self.invalidate_account_context(account_id)
+            raise
         finally:
+            if temporary is not None:
+                self._close_temporary_page(temporary, target_id)
+                with self._contexts_lock:
+                    retained = self._account_contexts.get(account_id)
+                if retained and retained.get("page") is main_page:
+                    self.page = main_page
             self._close_page()
 
     @staticmethod

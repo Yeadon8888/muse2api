@@ -441,6 +441,7 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = False, force: bool = False) 
             store.touch_keepalive(acc_id, True, f"会话正常 (VM: {res.get('vm_state') or 'RUNNING'})")
     except MuseAuthError as exc:
         store.mark(acc_id, False, str(exc))
+        engine.invalidate_account_context(acc_id)
         raise
     except MuseProxyError:
         raise
@@ -525,6 +526,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         last_exc = exc
                         if cur_id:
                             store.mark(cur_id, False, str(exc))
+                            engine.invalidate_account_context(cur_id)
                         engine.close_current_page()
                         break
                     except MuseWorkspaceUnavailable as exc:
@@ -1294,6 +1296,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 except MuseAuthError as exc:
                     last_exc = exc
                     store.mark(cur_acc["id"], False, str(exc))
+                    engine.invalidate_account_context(cur_acc["id"])
                     engine.close_current_page()
                     break
                 except MuseProxyError as exc:
@@ -1302,7 +1305,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     engine.close_current_page()
                     break
                 except MuseWorkspaceUnavailable as exc:
-                    # 关闭页面会先回存轮换 cookie；每账号只允许一次无 wake 的重新发现。
+                    # 只释放线程租约并回存轮换 cookie，保留可能已建立的 CVM 绑定；
+                    # 每账号只允许一次无 wake 的重新发现。
                     last_exc = exc
                     engine.close_current_page()
                     if not rediscovered:
@@ -1990,6 +1994,7 @@ def admin_status(_=Depends(auth)):
         "media_count": len(os.listdir(CFG.media_dir))
         if os.path.isdir(CFG.media_dir) else 0,
         "browser_running": bool(engine.proc and engine.proc.poll() is None),
+        "retained_account_contexts": engine.retained_context_count(),
         "essential_cookies": list(ESSENTIAL_COOKIES),
         "base_url": f"{base}/v1" if base else "",
         "config": {"site": CFG.site_url, "cdp_port": CFG.cdp_port,
@@ -2064,11 +2069,13 @@ def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
         if not existing:
             raise HTTPException(404, "账号不存在")
         changes = {"label": req.label, "enabled": req.enabled}
+        reset_context = req.enabled is False
         if "proxy" in req.model_fields_set:
             if aid in ACCOUNT_POOL.busy_accounts:
                 raise HTTPException(409, "账号正在执行任务或检测，请稍后再修改代理")
             proxy = req.proxy.configuration(existing.get("proxy")) if req.proxy else {}
             if proxy != (existing.get("proxy") or {}):
+                reset_context = True
                 changes.update(proxy=proxy, synced_at=0, last_keepalive=0,
                                checked_at=0, proxy_status={}, ok=None,
                                note="代理已修改，请重新测试")
@@ -2080,6 +2087,8 @@ def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
                 engine._last_http_renew.pop(aid, None)
             _PROXY_TEST_RECEIPTS.pop(aid, None)
         acc = store.update_account(aid, **changes)
+        if reset_context:
+            engine.invalidate_account_context(aid)
         return store.public_account(acc)
 
 
@@ -2142,6 +2151,7 @@ def del_account(aid: str, _=Depends(auth)):
         raise HTTPException(404, "账号不存在")
     with ACCOUNT_POOL.cond:
         _PROXY_TEST_RECEIPTS.pop(aid, None)
+    engine.invalidate_account_context(aid)
     return {"deleted": True, "id": aid}
 
 
@@ -2213,6 +2223,8 @@ def update_cookies(aid: str, payload: dict = Body(...), _=Depends(auth)):
                                cookies_exp=exp or None)
     if not acc:
         raise HTTPException(404, "账号不存在")
+    # 管理员补入的新登录可能属于不同身份，显式重建可避免沿用旧绑定。
+    engine.invalidate_account_context(aid)
     return {"ok": True, "id": aid, "cookie_count": len(cookies),
             "expires_at": acc.get("expires_at")}
 
@@ -2614,7 +2626,7 @@ def _warmup_browser_sync():
     except Exception as exc:  # noqa: BLE001
         log.warning("【浏览器预热】预热异常: %s", exc)
     finally:
-        # Warmup runs in a worker thread; do not retain its account reservation or page.
+        # 预热线程归还账号租约；close_current_page 只释放线程引用，长期主页仍保留。
         engine.close_current_page()
         _clear_account_proxy()
         if acc:

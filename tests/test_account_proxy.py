@@ -208,7 +208,7 @@ class AccountProxyTests(unittest.TestCase):
                 patch.object(engine, "_apply_cookies"), patch.object(engine, "_wait_ws_ready", return_value=True):
             self.assertIs(engine.ensure_page({}, account_id="fixture"), new_page)
             old_page.close.assert_called_once()
-            open_page.assert_called_once_with(proxy=new_proxy)
+            open_page.assert_called_once_with(proxy=new_proxy, account_id="fixture")
         engine.close_current_page()
 
     def test_authenticated_http_and_connect_and_shutdown(self):

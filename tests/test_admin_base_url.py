@@ -96,6 +96,8 @@ async def check(source, home, public_base):
                "/admin/status and /admin/apikey disagree")
         expect(served["config"]["public_base"] == public_base.rstrip("/"),
                "config.public_base must echo the configured value")
+        expect(served["retained_account_contexts"] == 0,
+               "fresh /admin/status must report zero retained account contexts")
 
         base_arg = build_cmd(served["base_url"])
         expect(bool(base_arg),
