@@ -1,5 +1,18 @@
 # MUSE2API
 
+## Railway 空闲浏览器回收
+
+可选设置 `MUSE2API_BROWSER_IDLE_SECONDS=300`，在全部浏览器任务释放执行槽位
+且连续空闲五分钟后关闭 Chromium；下一次任务沿用原有按需启动逻辑。
+默认值 `0` 关闭此功能，保持现有部署行为。清理期间会独占全部并发槽位，
+不会关闭仍在生成、对话或执行账号操作的浏览器。
+
+可同时设置 `MUSE2API_BROWSER_PREWARM=0`，跳过服务启动时的浏览器预热。
+会话续期仍保留；定时额度检查可能重新启动浏览器，因此这项优化降低的是
+空闲内存，不承诺 Railway 一定进入休眠。首次任务可能增加浏览器启动延迟。
+建议在任务排空后发布，再开启参数并观察排队时间、内存和错误率；回滚时将
+空闲时间设回 `0`、预热设回 `1`。不通过关闭浏览器中断正在处理的任务。
+
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python" alt="Python Version" />
   <img src="https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi" alt="FastAPI" />
@@ -508,3 +521,17 @@ python tests/test_session_health.py
 缺失或损坏的时长信息会被拒绝。PDF 页数、文档解析和账号权限仍由 Muse 上游校验，
 本项目的附件确认只表示文件进入输入区，不保证上游能够读取每一种文件。
 Chromium 与服务必须能访问同一份素材文件；临时素材位于浏览器 profile 目录并在任务结束后清理。
+
+### R2 视频分流
+
+设置 `MUSE2API_MEDIA_UPLOAD_URL`（网关 `/_internal/media`）、`MUSE2API_MEDIA_UPLOAD_TOKEN`
+和 `MUSE2API_MEDIA_PUBLIC_BASE`（网关 HTTPS origin）后，视频完成时流式上传 R2，成功才返回远端链接。
+上传失败保留本地下载，不重试生成。旧 `/v1/media/` 链接在上传成功后 307 跳转；Worker
+支持 HEAD、Range 分段读取，缺失或故障时带回源标记读取本地副本，避免循环跳转。
+
+后台每分钟最多补传三个超过一分钟且不超过 100 MiB 的本地视频；失败文件十分钟后再试。
+超过 100 MiB 的文件继续本地服务。成功记录持久化在数据卷 `media-offload/`。
+本地副本仍由原磁盘水位清理策略管理；R2 副本不会随本地清理自动删除，管理员删除会先删除远端，
+失败则保留本地。R2 存储及操作可能产生费用；首次上传仍消耗 Railway 出站，后续重复下载由 R2 承担。
+Worker 源码为 `deploy/media-worker/index.mjs`，需要 `MEDIA_BUCKET`、`MEDIA_UPLOAD_TOKEN`、
+`UPSTREAM_ORIGIN` 绑定。回滚应用可恢复本地链接，已返回的 R2 链接依赖保留 Worker 与桶。
