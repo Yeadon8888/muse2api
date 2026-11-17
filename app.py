@@ -46,7 +46,7 @@ import zipfile
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               Response, StreamingResponse)
+                               Response, StreamingResponse, RedirectResponse)
 from pydantic import model_validator, BaseModel, Field, SecretStr, field_validator
 
 from config import CFG
@@ -58,6 +58,7 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
 from engine import MuseProxyError, MuseSessionUnavailable, MuseWorkspaceUnavailable
 from store import Store, account_expiry, min_expiry
 from media_janitor import MediaJanitor
+from media_offload import MediaOffload
 from proxy import normalize_server, request_proxy_context, split_proxy_url
 
 import sys
@@ -90,6 +91,7 @@ app.add_middleware(CORSMiddleware,
 store = Store(CFG)
 engine = MuseEngine(CFG)
 media_janitor = MediaJanitor(CFG.data_dir, [CFG.media_dir, CFG.download_dir])
+media_offload = MediaOffload(CFG)
 engine.proxy_resolver = lambda aid: (store.get_account(aid) or {}).get("proxy")
 
 
@@ -1163,6 +1165,8 @@ def media_url(name: str) -> str:
     平台）拿到 data[].url 后一般会直接渲染或下载，相对路径会被解析到客户端
     自己的域名上，导致 404。public_base 为空时退回相对路径。
     """
+    if remote := media_offload.url(name):
+        return remote
     base = _public_base()
     return f"{base}/v1/media/{name}" if base else f"/v1/media/{name}"
 
@@ -1685,6 +1689,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
                 store.update_task(task["id"], progress=p)
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
                                           reference_images=ref_images, on_acquired=_on_acquired)
+            media_offload.publish(res["filename"])
             vurl = media_url(res["filename"])
             store.update_task(task["id"], status="completed", progress=100, account=acc_id,
                               elapsed=round(time.time() - timing["t0"], 1),
@@ -2030,9 +2035,14 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
 
 
 @app.get("/v1/media/{name}")
-def get_media(name: str):
+@app.head("/v1/media/{name}")
+def get_media(name: str, request: Request):
     if "/" in name or "\\" in name or ".." in name:
         raise HTTPException(400, "非法文件名")
+    # R2 缺失时 Worker 会回源；回源请求必须直接读本地，避免循环重定向。
+    if request.headers.get("x-muse-media-fallback") != "1":
+        if remote := media_offload.url(name):
+            return RedirectResponse(remote, status_code=307)
     p = os.path.join(CFG.media_dir, name)
     if not os.path.isfile(p):
         raise HTTPException(404, "文件不存在")
@@ -2500,6 +2510,8 @@ def admin_media(_=Depends(auth)):
             items.append({"name": name, "url": media_url(name), "bytes": os.path.getsize(p),
                           "mtime": int(os.path.getmtime(p)),
                           "kind": "video" if ext in (".mp4", ".webm", ".mov") else "image"})
+    present = {item["name"] for item in items}
+    items.extend(item for item in media_offload.records() if item["name"] not in present)
     items.sort(key=lambda x: x["mtime"], reverse=True)
     return {"media": items, "count": len(items)}
 
@@ -2519,12 +2531,20 @@ def delete_media(payload: dict = Body(default={}), _=Depends(auth)):
             errors.append(f"非法文件名: {name}")
             continue
         p = os.path.join(d, name)
-        if os.path.isfile(p):
+        with media_offload.lock:
             try:
-                os.remove(p)
+                remote_deleted = media_offload.delete(name)
+            except Exception:
+                errors.append(f"{name}: R2 删除失败，保留本地文件")
+                continue
+            if os.path.isfile(p):
+                try:
+                    os.remove(p)
+                    removed += 1
+                except OSError as e:
+                    errors.append(f"{name}: {str(e)}")
+            elif remote_deleted:
                 removed += 1
-            except OSError as e:
-                errors.append(f"{name}: {str(e)}")
     return {"removed": removed, "errors": errors}
 
 
@@ -2533,13 +2553,19 @@ def delete_single_media(name: str, _=Depends(auth)):
     if "/" in name or "\\" in name or ".." in name:
         raise HTTPException(400, "非法文件名")
     p = os.path.join(CFG.media_dir, name)
-    if not os.path.isfile(p):
-        raise HTTPException(404, "文件不存在")
-    try:
-        os.remove(p)
-        return {"status": "ok", "deleted": name}
-    except OSError as e:
-        raise HTTPException(500, f"删除失败: {e}")
+    with media_offload.lock:
+        try:
+            remote_deleted = media_offload.delete(name)
+        except Exception:
+            raise HTTPException(502, "R2 删除失败，保留本地文件")
+        if not os.path.isfile(p) and not remote_deleted:
+            raise HTTPException(404, "文件不存在")
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+            return {"status": "ok", "deleted": name}
+        except OSError as e:
+            raise HTTPException(500, f"删除失败: {e}")
 
 
 # ------------------------- 前端页面 -------------------------
@@ -2740,6 +2766,15 @@ async def _idle_browser_loop():
             await asyncio.to_thread(_release_idle_browser)
         except Exception:
             log.exception("【浏览器空闲回收】失败，将在下个周期重试")
+
+
+async def _media_offload_loop():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await asyncio.to_thread(media_offload.backfill)
+        except Exception as exc:
+            log.warning("R2 后台迁移暂未完成：%s", type(exc).__name__)
 
 
 async def _media_janitor_loop():
@@ -3143,6 +3178,8 @@ async def _startup():
     asyncio.create_task(_media_janitor_loop())
     if CFG.browser_idle_seconds > 0:
         asyncio.create_task(_idle_browser_loop())
+    if media_offload.enabled:
+        asyncio.create_task(_media_offload_loop())
 
 
 @app.on_event("shutdown")

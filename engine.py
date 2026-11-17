@@ -522,6 +522,9 @@ class MuseEngine:
                 except Exception:  # noqa: BLE001
                     self.proc.kill()
             self.proc = None
+            if self._log is not None:
+                self._log.close()
+                self._log = None
             with self._contexts_lock:
                 relays = list(self._proxy_relays)
                 self._proxy_relays.clear()

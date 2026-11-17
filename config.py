@@ -107,6 +107,9 @@ class Config:
         0.0, float(_env("MUSE2API_BROWSER_IDLE_SECONDS", "0"))))
     browser_prewarm: bool = field(default_factory=lambda:
         _env("MUSE2API_BROWSER_PREWARM", "1").strip() != "0")
+    media_upload_url: str = field(default_factory=lambda: _env("MUSE2API_MEDIA_UPLOAD_URL", ""))
+    media_upload_token: str = field(default_factory=lambda: _env("MUSE2API_MEDIA_UPLOAD_TOKEN", ""))
+    media_public_base: str = field(default_factory=lambda: _env("MUSE2API_MEDIA_PUBLIC_BASE", ""))
 
     # muse.ai 暂未给账号分配工作区时，短暂冷却该账号，避免所有任务反复打开页面。
     workspace_cooldown_seconds: int = field(
