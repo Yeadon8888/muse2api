@@ -98,11 +98,13 @@ class ConcurrencyLock:
     由 CFG.max_concurrency 限制最大并发槽位；
     同时提供与标准 Lock 兼容的 acquire / release / locked 接口，
     确保向下兼容历史单锁断言与管理端操作。"""
-    def __init__(self, limit: int = 2):
+    def __init__(self, limit: int = 2, clock=time.monotonic):
         self.limit = max(1, limit)
         self._sem = threading.Semaphore(self.limit)
         self._count_lock = threading.Lock()
         self._active_count = 0
+        self._clock = clock
+        self._last_activity = clock()
 
     def acquire(self, blocking: bool = True, timeout: float | None = -1) -> bool:
         if timeout is None:
@@ -114,17 +116,38 @@ class ConcurrencyLock:
         if ok:
             with self._count_lock:
                 self._active_count += 1
+                self._last_activity = self._clock()
         return ok
 
     def release(self):
         with self._count_lock:
             if self._active_count > 0:
                 self._active_count -= 1
+                self._last_activity = self._clock()
         self._sem.release()
 
     def locked(self) -> bool:
         with self._count_lock:
             return self._active_count > 0
+
+    def run_if_idle(self, idle_seconds: float, action) -> bool:
+        """占住全部槽位后才允许清理，避免检查空闲与新任务启动之间的竞态。"""
+        if idle_seconds <= 0:
+            return False
+        acquired = 0
+        try:
+            for _ in range(self.limit):
+                if not self._sem.acquire(blocking=False):
+                    return False
+                acquired += 1
+            with self._count_lock:
+                if self._active_count or self._clock() - self._last_activity < idle_seconds:
+                    return False
+                action()
+                return True
+        finally:
+            for _ in range(acquired):
+                self._sem.release()
 
     def __enter__(self):
         self.acquire()
@@ -2689,16 +2712,34 @@ async def _keepalive_loop():
     """后台常驻守护任务：每 15 分钟轮询一次账号健康状态并保持 VM 热备。"""
     log.info("【自动保活守护进程】已启动，检测周期: 15 分钟")
     await asyncio.sleep(1)
-    try:
-        await asyncio.to_thread(_warmup_browser_sync)
-    except Exception as e:  # noqa: BLE001
-        log.warning("【浏览器预热】异常: %s", e)
+    if CFG.browser_prewarm:
+        try:
+            await asyncio.to_thread(_warmup_browser_sync)
+        except Exception as e:  # noqa: BLE001
+            log.warning("【浏览器预热】异常: %s", e)
     while True:
         try:
             await run_keepalive_all(force=False)
         except Exception as e:  # noqa: BLE001
             log.error("【自动保活守护进程】轮询异常: %s", e)
         await asyncio.sleep(900)
+
+
+def _release_idle_browser():
+    def close():
+        if engine.browser is not None or engine.proc is not None:
+            engine.stop()
+            log.info("【浏览器空闲回收】已释放浏览器，下次任务会按需启动")
+    return GEN_LOCK.run_if_idle(CFG.browser_idle_seconds, close)
+
+
+async def _idle_browser_loop():
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await asyncio.to_thread(_release_idle_browser)
+        except Exception:
+            log.exception("【浏览器空闲回收】失败，将在下个周期重试")
 
 
 async def _media_janitor_loop():
@@ -3100,6 +3141,8 @@ async def _startup():
         log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥: %s", new_key)
     asyncio.create_task(_keepalive_loop())
     asyncio.create_task(_media_janitor_loop())
+    if CFG.browser_idle_seconds > 0:
+        asyncio.create_task(_idle_browser_loop())
 
 
 @app.on_event("shutdown")

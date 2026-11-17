@@ -1,5 +1,18 @@
 # MUSE2API
 
+## Railway 空闲浏览器回收
+
+可选设置 `MUSE2API_BROWSER_IDLE_SECONDS=300`，在全部浏览器任务释放执行槽位
+且连续空闲五分钟后关闭 Chromium；下一次任务沿用原有按需启动逻辑。
+默认值 `0` 关闭此功能，保持现有部署行为。清理期间会独占全部并发槽位，
+不会关闭仍在生成、对话或执行账号操作的浏览器。
+
+可同时设置 `MUSE2API_BROWSER_PREWARM=0`，跳过服务启动时的浏览器预热。
+会话续期仍保留；定时额度检查可能重新启动浏览器，因此这项优化降低的是
+空闲内存，不承诺 Railway 一定进入休眠。首次任务可能增加浏览器启动延迟。
+建议在任务排空后发布，再开启参数并观察排队时间、内存和错误率；回滚时将
+空闲时间设回 `0`、预热设回 `1`。不通过关闭浏览器中断正在处理的任务。
+
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python" alt="Python Version" />
   <img src="https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi" alt="FastAPI" />
